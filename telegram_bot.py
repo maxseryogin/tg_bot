@@ -884,9 +884,15 @@ async def download_music_by_query(query: str):
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
-        "extractor_args": {"youtube": {"player_client": ["web", "android", "tv_embedded", "web_embedded", "mweb"]}},
+        "extractor_args": {"youtube": {"player_client": ["ios", "android", "tv_embedded"]}},
+        "http_headers": {
+            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
         "max_filesize": 48 * 1024 * 1024,
+        "socket_timeout": 30,
+        "retries": 5,
     }
     loop = asyncio.get_event_loop()
 
