@@ -899,73 +899,46 @@ async def download_music_by_query(query: str):
     }
     loop = asyncio.get_event_loop()
 
-    def _search_via_piped(q: str):
-        """Ищет видео через Piped API (не требует токенов YouTube)."""
-        import urllib.request, json as _json, urllib.parse
-        instances = [
-            "https://pipedapi.kavin.rocks",
-            "https://piped-api.garudalinux.org",
-            "https://api.piped.projectsegfau.lt",
-        ]
-        for base in instances:
-            try:
-                url = f"{base}/search?q={urllib.parse.quote(q)}&filter=music_songs"
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    data = _json.loads(r.read())
-                items = data.get("items") or []
-                ids = []
-                for item in items[:5]:
-                    vid_url = item.get("url", "")
-                    if "watch?v=" in vid_url:
-                        vid_id = vid_url.split("watch?v=")[-1].split("&")[0]
-                        if vid_id:
-                            ids.append((vid_id, item.get("title", q), item.get("uploaderName", ""), item.get("duration", 0)))
-                if ids:
-                    return ids
-            except Exception:
-                continue
-        return []
-
     def _download():
+        import subprocess as _sp
         last_error = ""
 
-        # Шаг 1: ищем через Piped (обходит YouTube ботозащиту)
+        # Шаг 1: ищем через subprocess yt-dlp (как мелстрой — надёжнее)
         entries_to_try = []
-        piped_results = _search_via_piped(query)
-        if piped_results:
-            entries_to_try = [(f"https://www.youtube.com/watch?v={vid_id}", title, uploader, duration)
-                              for vid_id, title, uploader, duration in piped_results]
-
-        # Шаг 2: если Piped не помог — пробуем через yt-dlp ytsearch
-        if not entries_to_try:
-            try:
-                with YoutubeDL({**base_opts, "default_search": "ytsearch5", "ignoreerrors": True}) as ydl:
-                    info = ydl.extract_info(query, download=False)
-                    if info:
-                        raw_entries = info.get("entries") or []
-                        if not isinstance(raw_entries, list):
-                            raw_entries = [raw_entries] if raw_entries else []
-                        for e in raw_entries:
-                            if e and e.get("id"):
-                                vid_id = e["id"]
-                                entries_to_try.append((
-                                    f"https://www.youtube.com/watch?v={vid_id}",
-                                    e.get("title", query),
-                                    e.get("uploader", "") or e.get("channel", ""),
-                                    e.get("duration", 0),
-                                ))
-            except Exception as e:
-                last_error = str(e)[:200]
+        try:
+            result = _sp.run(
+                ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
+                 "--no-warnings", "--default-search", "ytsearch5", query],
+                capture_output=True, text=True, timeout=30
+            )
+            for line in result.stdout.splitlines():
+                parts = line.strip().split("\t")
+                if len(parts) >= 2 and parts[0].strip():
+                    vid_id = parts[0].strip()
+                    title = parts[1].strip() if len(parts) > 1 else query
+                    uploader = parts[2].strip() if len(parts) > 2 else ""
+                    try:
+                        duration = int(parts[3]) if len(parts) > 3 else 0
+                    except Exception:
+                        duration = 0
+                    entries_to_try.append((f"https://www.youtube.com/watch?v={vid_id}", title, uploader, duration))
+        except Exception as e:
+            last_error = str(e)[:200]
 
         if not entries_to_try:
             return None, last_error or "ничего не найдено", None, None
 
-        # Шаг 3: скачиваем первый успешный
+        # Шаг 2: скачиваем первый успешный через subprocess
         for url, title, uploader, duration in entries_to_try[:5]:
             try:
-                with YoutubeDL({**base_opts, "noplaylist": True}) as ydl:
-                    ydl.download([url])
+                out_template = os.path.join(tmpdir, "track.%(ext)s")
+                _sp.run(
+                    ["yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio/best",
+                     "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+                     "--no-playlist", "--no-warnings", "--max-filesize", "48m",
+                     "-o", out_template, url],
+                    capture_output=True, text=True, timeout=120
+                )
                 for fname in os.listdir(tmpdir):
                     if fname.endswith(".mp3"):
                         fpath = os.path.join(tmpdir, fname)
