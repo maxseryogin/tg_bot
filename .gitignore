@@ -1,0 +1,12 @@
+# Удали bot_config.ini из отслеживания git
+git rm --cached bot_config.ini
+
+# Добавь в .gitignore
+echo "bot_config.ini" >> .gitignore
+
+# Также добавим лишнее что не нужно на сервере
+echo "__pycache__/" >> .gitignore
+echo "rep_cache/" >> .gitignore
+echo "ad_cache/" >> .gitignore
+echo "juza_chat_state.json" >> .gitignore
+echo "rep_cache.json" >> .gitignorebot_config.ini

@@ -1,0 +1,1979 @@
+import requests
+import base64
+import asyncio
+import json
+import logging
+import os
+import random
+import re
+import tempfile
+import time
+from collections import defaultdict
+
+# Загрузка .env при наличии (опционально: pip install python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+def _config(key: str, default: str = "") -> str:
+    """Читает значение из: os.environ → .env → bot_config.ini."""
+    if key in os.environ and os.environ[key].strip():
+        return os.environ[key].strip()
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    search_dirs = [base_dir, os.path.dirname(base_dir), os.getcwd()]
+    for search_dir in search_dirs:
+        for env_name in (".env", ".env.local"):
+            env_path = os.path.join(search_dir, env_name)
+            if os.path.isfile(env_path):
+                try:
+                    with open(env_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            if "=" in line:
+                                k, _, v = line.partition("=")
+                                if k.strip() == key:
+                                    v = v.strip().strip('"').strip("'")
+                                    if v:
+                                        return v
+                except Exception:
+                    pass
+
+    try:
+        import configparser
+        path = os.path.join(base_dir, "bot_config.ini")
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or line.startswith("["):
+                        continue
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        if k.strip() == key:
+                            v = v.strip().strip('"').strip("'")
+                            if v:
+                                return v
+            cfg = configparser.ConfigParser()
+            cfg.read(path, encoding="utf-8")
+            for section in ("bot", "DEFAULT"):
+                if cfg.has_section(section):
+                    val = cfg.get(section, key, fallback=None)
+                    if val is not None and str(val).strip():
+                        return str(val).strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return default
+
+BOT_TOKEN = _config("TELEGRAM_BOT_TOKEN")
+_allowed = _config("ALLOWED_USER_ID", "0")
+ALLOWED_USER_ID = int(_allowed) if _allowed.isdigit() else 0
+HUGGINGFACE_TOKEN = _config("HUGGINGFACE_TOKEN", "")
+PLAYER_URL = _config("PLAYER_URL", "http://localhost:9988")
+TOGETHER_API_TOKEN = _config("TOGETHER_API_TOKEN", "")
+GEMINI_API_KEY = _config("GEMINI_API_KEY", "")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("telegram_bot")
+
+TRIGGER_MENTION = "orqis"
+TRIGGER_WORD = "сгк"
+TRIGGER_PATTERN = re.compile(r"@?\s*" + re.escape(TRIGGER_MENTION) + r"\s+.*?" + re.escape(TRIGGER_WORD), re.IGNORECASE | re.DOTALL)
+
+
+def _get_backend():
+    return None
+
+
+def _fetch_player_info() -> dict:
+    url = f"{PLAYER_URL}/now"
+    headers = {}
+    if "ngrok" in PLAYER_URL.lower():
+        headers["ngrok-skip-browser-warning"] = "1"
+    try:
+        resp = requests.get(url, timeout=5, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning("HTTP-мост: статус %d от %s", resp.status_code, url)
+    except requests.exceptions.ConnectionError:
+        logger.warning("HTTP-мост: нет соединения с %s", url)
+    except requests.exceptions.Timeout:
+        logger.warning("HTTP-мост: таймаут запроса к %s", url)
+    except Exception as e:
+        logger.warning("HTTP-мост: ошибка (%s): %s", url, e)
+    return {}
+
+
+def _get_current_track_info(backend=None) -> dict:
+    empty = {
+        "artist": "", "title": "", "cover_data": "",
+        "lyrics": "", "filepath": "", "has_track": False, "playing": False,
+    }
+
+    if backend is not None:
+        try:
+            idx = getattr(backend, "current_index", -1)
+            if idx is None or idx < 0:
+                return empty
+            visible = getattr(getattr(backend, "track_model", None), "_visible_tracks", [])
+            if idx >= len(visible):
+                return empty
+            track = visible[idx]
+            lyrics = getattr(backend, "_current_lyrics_text", "") or ""
+            if lyrics.startswith("⏳"):
+                lyrics = ""
+            return {
+                "artist":     getattr(track, "artist", ""),
+                "title":      getattr(track, "title", ""),
+                "cover_data": getattr(track, "cover_data", ""),
+                "lyrics":     lyrics,
+                "filepath":   getattr(track, "filepath", ""),
+                "has_track":  True,
+                "playing":    bool(getattr(backend, "isPlaying", False)),
+            }
+        except Exception as e:
+            logger.exception("Ошибка чтения local backend: %s", e)
+            return empty
+
+    data = _fetch_player_info()
+    if not data or not data.get("title"):
+        return empty
+    return {
+        "artist":     data.get("artist", ""),
+        "title":      data.get("title", ""),
+        "cover_data": data.get("cover", ""),
+        "has_cover":  bool(data.get("has_cover", False)),
+        "lyrics":     data.get("lyrics", ""),
+        "filepath":   data.get("filepath", ""),
+        "has_track":  bool(data.get("title")),
+        "playing":    bool(data.get("playing", False)),
+    }
+
+
+def _html_quote(text: str) -> str:
+    if not text:
+        return ""
+    escaped = (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return f"<blockquote>{escaped}</blockquote>"
+
+
+def clean_post_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("**", "")
+    text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)
+    lines = [line.strip() for line in text.splitlines()]
+    text = "\n".join(lines).strip()
+    return text
+
+
+def _decode_cover_to_bytes(cover_data: str):
+    if not cover_data or not cover_data.startswith("data:"):
+        return None, None
+    try:
+        head, _, b64 = cover_data.partition(",")
+        mime = "image/jpeg"
+        if ";" in head:
+            mime = head.split(";")[0].replace("data:", "").strip()
+        raw = base64.b64decode(b64)
+        return raw, mime
+    except Exception as e:
+        logger.warning("Не удалось декодировать обложку: %s", e)
+        return None, None
+
+
+async def cmd_trigger(message, bot, backend):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+
+    info = _get_current_track_info(backend)
+    if not info["has_track"] or (not info["title"] and not info["artist"]):
+        raw = _fetch_player_info()
+        if not raw:
+            await message.answer("🔌 Плеер недоступен — запусти mp3 player на своём компе.")
+        else:
+            await message.answer("Сейчас ничего не играет.")
+        return
+
+    status_emoji = "▶️" if info.get("playing") else "⏸"
+    status_label = "слушает" if info.get("playing") else "поставила на паузу"
+    text = f"{status_emoji} Жужа {status_label}\n\n🎤 {info['artist']}\n🎵 {info['title']}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📝 Получить текст", callback_data="get_lyrics"),
+            InlineKeyboardButton(text="⬇️ Скачать песню", callback_data="download_track"),
+        ]
+    ])
+
+    photo = None
+    if info.get("has_cover") or info.get("cover_data"):
+        try:
+            cover_url = f"{PLAYER_URL}/cover"
+            cover_resp = requests.get(cover_url, timeout=8)
+            if cover_resp.status_code == 200:
+                mime = cover_resp.headers.get("Content-Type", "image/jpeg")
+                ext = "png" if "png" in mime else "jpg"
+                photo = BufferedInputFile(cover_resp.content, filename=f"cover.{ext}")
+            else:
+                logger.warning("GET /cover вернул статус %d", cover_resp.status_code)
+        except Exception as e:
+            logger.warning("Не удалось получить обложку с %s/cover: %s", PLAYER_URL, e)
+
+        if photo is None and info.get("cover_data"):
+            cover_bytes, mime = _decode_cover_to_bytes(info["cover_data"])
+            if cover_bytes:
+                ext = "jpg" if "jpeg" in mime or "jpg" in mime else "png"
+                photo = BufferedInputFile(cover_bytes, filename=f"cover.{ext}")
+
+    if photo:
+        try:
+            await message.answer_photo(photo=photo, caption=text, reply_markup=keyboard)
+            return
+        except Exception as e:
+            logger.warning("answer_photo упала (%s), отправляю без фото", e)
+
+    try:
+        await message.answer(text, reply_markup=keyboard)
+    except Exception as e:
+        logger.exception("Ошибка отправки: %s", e)
+        await message.answer("Ошибка при формировании ответа.")
+
+
+async def handle_callback(callback, bot, backend):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    data = callback.data
+    message = callback.message
+    chat_id = message.chat.id
+    message_id = message.message_id
+
+    def remove_button(remove_data: str):
+        try:
+            kb = message.reply_markup
+            if not kb or not kb.inline_keyboard:
+                return None
+            new_rows = []
+            for row in kb.inline_keyboard:
+                new_buttons = [b for b in row if getattr(b, "callback_data", None) != remove_data]
+                if new_buttons:
+                    new_rows.append(new_buttons)
+            if new_rows:
+                return InlineKeyboardMarkup(inline_keyboard=new_rows)
+        except Exception:
+            pass
+        return None
+
+    if data == "get_lyrics":
+        new_kb = remove_button("get_lyrics")
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=new_kb)
+        except Exception as e:
+            logger.warning("Не удалось обновить клавиатуру: %s", e)
+
+        info = _get_current_track_info(backend)
+        lyrics = (info.get("lyrics") or "").strip()
+        LOADING_MARKERS = ("Загрузка...", "⏳", "Текст песни не найден", "Ошибка")
+        has_lyrics = bool(lyrics) and not any(lyrics.startswith(m) for m in LOADING_MARKERS)
+
+        if not has_lyrics:
+            await callback.answer("Текст ещё не загружен", show_alert=False)
+            await bot.send_message(chat_id=chat_id, text="😔 Текст пока не загружен, попробуй через пару секунд.",
+                                   reply_to_message_id=message_id)
+        else:
+            await callback.answer("Текст отправлен")
+            await bot.send_message(chat_id=chat_id, text=_html_quote(lyrics),
+                                   reply_to_message_id=message_id, parse_mode="HTML")
+        return
+
+    if data == "download_track":
+        info = _get_current_track_info(backend)
+        new_kb = remove_button("download_track")
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=new_kb)
+        except Exception as e:
+            logger.warning("Не удалось обновить клавиатуру: %s", e)
+        await callback.answer()
+        filepath = info.get("filepath") or ""
+        if not filepath or not os.path.isfile(filepath):
+            await bot.send_message(chat_id=chat_id, text="Файл трека недоступен.", reply_to_message_id=message_id)
+            return
+        try:
+            with open(filepath, "rb") as f:
+                audio_bytes = f.read()
+            from aiogram.types import BufferedInputFile
+            audio_file = BufferedInputFile(audio_bytes, filename=os.path.basename(filepath))
+            await bot.send_audio(chat_id=chat_id, audio=audio_file,
+                                 title=info.get("title"), performer=info.get("artist"))
+        except Exception as e:
+            logger.exception("Ошибка отправки файла: %s", e)
+            await bot.send_message(chat_id=chat_id, text="Не удалось отправить файл.", reply_to_message_id=message_id)
+        return
+
+    await callback.answer()
+
+
+# ── Кулдауны ──────────────────────────────────────────────────────────────────
+_quote_cooldowns = {}
+_rep_cooldowns = {}
+_image_cooldowns = {}
+
+# ── Жужа-болталка ─────────────────────────────────────────────────────────────
+_chat_mode_enabled: dict[int, bool] = {}
+_chat_history: dict[int, list] = {}
+_CHAT_HISTORY_MAX  = 30
+CHAT_ON_TRIGGER    = "жужа го говорить"
+CHAT_OFF_TRIGGER   = "жужа хватит говорить"
+CHAT_TEST_TRIGGER  = "жужа ты тут"
+CHAT_REPLY_CHANCE  = 0.35
+_CHAT_STATE_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "juza_chat_state.json")
+
+
+def _chat_state_save():
+    try:
+        enabled = [cid for cid, v in _chat_mode_enabled.items() if v]
+        with open(_CHAT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(enabled, f)
+    except Exception as e:
+        logger.warning("Не удалось сохранить состояние болталки: %s", e)
+
+
+def _chat_state_load():
+    try:
+        if os.path.isfile(_CHAT_STATE_FILE):
+            with open(_CHAT_STATE_FILE, "r", encoding="utf-8") as f:
+                enabled = json.load(f)
+            for cid in enabled:
+                _chat_mode_enabled[int(cid)] = True
+            logger.info("Болталка: загружено %d активных чатов", len(enabled))
+    except Exception as e:
+        logger.warning("Не удалось загрузить состояние болталки: %s", e)
+
+
+QUOTE_TRIGGER      = "жужа цитату"
+QUOTE_API_URL      = "https://randomall.ru/api/gens/6381"
+QUOTE_COOLDOWN_SEC = 60
+
+REP_TRIGGER        = "жужа го реповать"
+REP_COOLDOWN_SEC   = 60
+REP_CHANNEL        = "citatarap"
+_REP_CACHE_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rep_cache")
+_REP_CACHE_JSON    = os.path.join(_REP_CACHE_DIR, "cache.json")
+
+AD_TRIGGER         = "жужа рекламу"
+AD_COOLDOWN_SEC    = 60
+AD_CHANNEL         = "reklamarolok"
+_AD_CACHE_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ad_cache")
+_AD_CACHE_JSON     = os.path.join(_AD_CACHE_DIR, "cache.json")
+_ad_cooldowns      = {}
+
+SEARCH_TRIGGER      = "жужа найди"
+SEARCH_COOLDOWN_SEC = 30
+_search_cooldowns   = {}
+
+MUSIC_TRIGGER       = "жужа музло"
+MUSIC_COOLDOWN_SEC  = 30
+_music_cooldowns    = {}
+
+HELP_TRIGGER        = "жужа шо можешь"
+HELP_COOLDOWN_SEC   = 10
+_help_cooldowns     = {}
+
+HELP_TEXT = (
+    "<pre>"
+    "жужа шо можешь\n"
+    "жужа нарисуй [промпт]\n"
+    "жужа музло [запрос]\n"
+    "жужа найди [запрос]\n"
+    "жужа цитату\n"
+    "жужа го реповать\n"
+    "жужа рекламу\n"
+    "жужа мем мелстрой\n"
+    "жужа го говорить\n"
+    "жужа хватит говорить\n"
+    "жужа ты тут\n"
+    "сгк"
+    "</pre>"
+)
+
+MEME_TRIGGER        = "жужа мем мелстрой"
+MEME_COOLDOWN_SEC   = 60
+MEME_PLAYLIST_ID    = "PLxlt0ae8BD2whwfIfPGtwtn7sOami7s7b"
+_meme_cooldowns     = {}
+
+HF_MODELS = [
+    "stabilityai/stable-diffusion-3.5-medium",
+    "black-forest-labs/FLUX.1-schnell",
+    "stabilityai/stable-diffusion-2-1",
+    "runwayml/stable-diffusion-v1-5",
+    "stabilityai/stable-diffusion-xl-base-1.0",
+]
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
+
+# ── Генерация картинок ─────────────────────────────────────────────────────────
+DRAW_TRIGGER         = "жужа нарисуй"
+DRAW_COOLDOWN_SEC    = 60       # личный кулдаун пользователя
+_draw_cooldowns: dict[int, float] = {}
+
+# Лимит на чат: не более DRAW_CHAT_LIMIT картинок за DRAW_CHAT_WINDOW секунд от всех
+_draw_chat_timestamps: dict[int, list] = defaultdict(list)
+DRAW_CHAT_LIMIT  = 2
+DRAW_CHAT_WINDOW = 60.0
+
+REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
+TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
+
+
+def _draw_chat_check_and_record(chat_id: int) -> tuple:
+    """
+    Проверяет лимит картинок для чата.
+    Если лимит не превышен — добавляет метку и возвращает (True, 0).
+    Если превышен — возвращает (False, секунд_до_сброса).
+    """
+    now = time.time()
+    ts = _draw_chat_timestamps[chat_id]
+    ts[:] = [t for t in ts if now - t < DRAW_CHAT_WINDOW]
+
+    if len(ts) >= DRAW_CHAT_LIMIT:
+        wait = int(DRAW_CHAT_WINDOW - (now - min(ts))) + 1
+        return False, wait
+
+    ts.append(now)
+    return True, 0
+
+
+# ── Функции генерации изображений ─────────────────────────────────────────────
+
+# ── Локальная генерация через diffusers (Stable Diffusion) ────────────────────
+_sd_pipeline = None       # кэш пайплайна (загружается один раз)
+_sd_pipe_lock = None      # asyncio.Lock, создаётся при первом использовании
+
+def _sd_lock():
+    global _sd_pipe_lock
+    if _sd_pipe_lock is None:
+        _sd_pipe_lock = asyncio.Lock()
+    return _sd_pipe_lock
+
+
+def _try_load_sd_pipeline():
+    """
+    Пробует загрузить SD пайплайн локально.
+    Порядок: любая уже скачанная модель → скачать реалистичную (небольшая).
+    Возвращает pipeline или None если diffusers не установлен / нет памяти.
+    """
+    global _sd_pipeline
+    if _sd_pipeline is not None:
+        return _sd_pipeline
+    try:
+        import torch
+        from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+        import gc
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype  = torch.float16 if device == "cuda" else torch.float32
+        logger.info(f"SD: загружаем модель на {device} ({dtype})")
+
+        model_ids = [
+            "stablediffusionapi/realistic-vision-v51",   # ~2GB, реалистичные
+            "runwayml/stable-diffusion-v1-5",            # ~4GB, стандарт
+            "CompVis/stable-diffusion-v1-4",             # ~4GB, классика
+        ]
+
+        for model_id in model_ids:
+            try:
+                logger.info(f"SD: пробуем {model_id}...")
+                pipe = StableDiffusionPipeline.from_pretrained(
+                    model_id,
+                    torch_dtype=dtype,
+                    safety_checker=None,
+                    requires_safety_checker=False,
+                    low_cpu_mem_usage=True,
+                )
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+                if device == "cpu":
+                    pipe.enable_attention_slicing()
+                pipe = pipe.to(device)
+                _sd_pipeline = pipe
+                logger.info(f"SD: модель {model_id} загружена ✓")
+                return pipe
+            except Exception as e:
+                logger.warning(f"SD: {model_id} не удалось загрузить: {e}")
+                gc.collect()
+                continue
+
+        logger.warning("SD: ни одна модель не загрузилась")
+        return None
+    except ImportError:
+        logger.info("SD: diffusers/torch не установлены — локальная генерация недоступна")
+        return None
+    except Exception as e:
+        logger.warning(f"SD: ошибка загрузки пайплайна: {e}")
+        return None
+
+
+async def generate_image_local(prompt: str) -> tuple:
+    """
+    Локальная генерация через Stable Diffusion (diffusers).
+    Возвращает (image_bytes, error_message).
+    """
+    import io
+    async with _sd_lock():
+        loop = asyncio.get_event_loop()
+        try:
+            pipe = await loop.run_in_executor(None, _try_load_sd_pipeline)
+            if pipe is None:
+                return None, "SD не установлен"
+
+            def _gen():
+                import torch
+                result = pipe(
+                    prompt,
+                    num_inference_steps=25,
+                    guidance_scale=7.5,
+                    width=512,
+                    height=512,
+                ).images[0]
+                buf = io.BytesIO()
+                result.save(buf, format="PNG")
+                return buf.getvalue()
+
+            logger.info("SD: генерируем локально...")
+            image_bytes = await loop.run_in_executor(None, _gen)
+            logger.info(f"SD: готово ({len(image_bytes)//1024}KB) ✓")
+            return image_bytes, None
+        except Exception as e:
+            logger.warning(f"SD: ошибка генерации: {e}")
+            return None, str(e)[:100]
+
+
+async def generate_image_g4f(prompt: str) -> tuple:
+    """
+    Генерация через g4f (gpt4free) — FLUX модель, бесплатно, без токенов.
+    Возвращает (image_bytes, error_str).
+    Установка: pip install g4f
+    """
+    import aiohttp
+
+    try:
+        from g4f.client import Client as G4FClient
+    except ImportError:
+        return None, "g4f не установлен (pip install g4f)"
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _gen():
+            client = G4FClient()
+            response = client.images.generate(
+                model="flux",
+                prompt=prompt,
+                response_format="url",
+            )
+            return response.data[0].url
+
+        img_url = await loop.run_in_executor(None, _gen)
+        if not img_url:
+            return None, "g4f: пустой URL"
+
+        logger.info("g4f FLUX: получен URL, скачиваем...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    image_bytes = await resp.read()
+                    if len(image_bytes) > 1000:
+                        logger.info("g4f FLUX: ✓ %dKB", len(image_bytes) // 1024)
+                        return image_bytes, None
+                return None, f"g4f: не удалось скачать картинку (HTTP {resp.status})"
+
+    except Exception as e:
+        logger.warning("g4f exception: %s", e)
+        return None, f"g4f: {str(e)[:100]}"
+
+
+async def generate_image_gemini(prompt: str) -> tuple:
+    import aiohttp, base64 as _b64
+
+    if not GEMINI_API_KEY:
+        return None, "GEMINI_API_KEY не задан"
+
+    GEMINI_IMAGE_MODELS = [
+        "gemini-2.0-flash-exp-image-generation",
+        "gemini-2.0-flash-preview-image-generation",
+        "gemini-2.0-flash",
+    ]
+    payload = {
+        "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    last_err = "все модели недоступны"
+    try:
+        async with aiohttp.ClientSession() as session:
+            for model in GEMINI_IMAGE_MODELS:
+                url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                       f"{model}:generateContent?key={GEMINI_API_KEY}")
+                try:
+                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        data = await resp.json()
+                        if resp.status != 200:
+                            err = data.get("error", {}).get("message", str(resp.status))
+                            last_err = f"{model}: {err[:80]}"
+                            continue
+                        for candidate in data.get("candidates", []):
+                            for part in candidate.get("content", {}).get("parts", []):
+                                b64 = part.get("inlineData", {}).get("data", "")
+                                if b64:
+                                    image_bytes = _b64.b64decode(b64)
+                                    logger.info("Gemini[%s]: ✓ %dKB", model, len(image_bytes) // 1024)
+                                    return image_bytes, None
+                        last_err = f"{model}: нет картинки в ответе"
+                except asyncio.TimeoutError:
+                    last_err = f"{model}: таймаут"
+                except Exception as e:
+                    last_err = f"{model}: {str(e)[:60]}"
+        return None, f"Gemini: {last_err}"
+    except Exception as e:
+        return None, str(e)[:100]
+
+
+async def generate_image_together(prompt: str) -> tuple:
+    import aiohttp
+
+    if not TOGETHER_API_TOKEN:
+        return None, "TOGETHER_API_TOKEN не задан"
+
+    headers = {"Authorization": f"Bearer {TOGETHER_API_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "model": "black-forest-labs/FLUX.1-schnell-Free",
+        "prompt": prompt,
+        "width": 1024, "height": 1024, "steps": 4, "n": 1,
+        "response_format": "b64_json",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(TOGETHER_URL, headers=headers, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    b64 = (data.get("data") or [{}])[0].get("b64_json", "")
+                    if b64:
+                        import base64 as _b64
+                        image_bytes = _b64.b64decode(b64)
+                        logger.info("Together AI: ✓ %dKB", len(image_bytes) // 1024)
+                        return image_bytes, None
+                    return None, "Together AI: пустой b64_json"
+                return None, f"Together AI: HTTP {resp.status}"
+    except asyncio.TimeoutError:
+        return None, "Together AI: таймаут"
+    except Exception as e:
+        return None, str(e)[:100]
+
+
+async def generate_image_replicate(prompt: str, width: int = 1024, height: int = 1024) -> tuple:
+    if not REPLICATE_API_TOKEN:
+        return None, "REPLICATE_API_TOKEN не задан"
+
+    import aiohttp
+
+    headers = {"Authorization": f"Token {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "version": "39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
+        "input": {"prompt": prompt, "width": width, "height": height,
+                  "num_inference_steps": 30, "guidance_scale": 7.5},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.replicate.com/v1/predictions",
+                                    json=payload, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status not in (200, 201):
+                    return None, f"Replicate: ошибка {resp.status}"
+                data = await resp.json()
+                prediction_id = data.get("id")
+                if not prediction_id:
+                    return None, "Replicate: не получен prediction ID"
+
+            poll_url = f"https://api.replicate.com/v1/predictions/{prediction_id}"
+            for _ in range(40):
+                await asyncio.sleep(3)
+                async with session.get(poll_url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=10)) as chk:
+                    if chk.status != 200:
+                        continue
+                    chk_data = await chk.json()
+                    status = chk_data.get("status")
+                    if status == "succeeded":
+                        output = chk_data.get("output")
+                        img_url = output[0] if isinstance(output, list) and output else output
+                        if not img_url:
+                            return None, "Replicate: пустой output"
+                        async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=20)) as img_resp:
+                            if img_resp.status == 200:
+                                return await img_resp.read(), None
+                        return None, "Replicate: не удалось скачать"
+                    elif status in ("failed", "canceled"):
+                        return None, f"Replicate: {chk_data.get('error') or 'ошибка'}"
+            return None, "Replicate: таймаут"
+    except Exception as e:
+        return None, str(e)[:100]
+
+
+async def generate_image_stable_horde(prompt: str) -> tuple:
+    import aiohttp
+
+    api_key = _config("STABLE_HORDE_TOKEN", "0000000000")
+    base = "https://stablehorde.net/api/v2"
+    payload = {
+        "prompt": prompt,
+        "params": {"sampler_name": "k_euler_a", "cfg_scale": 7, "steps": 25,
+                   "width": 1024, "height": 1024, "n": 1},
+        "models": ["Deliberate"], "r2": True, "shared": False,
+    }
+    headers = {"apikey": api_key, "Content-Type": "application/json", "Client-Agent": "telegram_bot:1.0"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{base}/generate/async", json=payload, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status not in (200, 202):
+                    return None, None
+                data = await resp.json()
+                job_id = data.get("id")
+                if not job_id:
+                    return None, None
+
+            for _ in range(40):
+                await asyncio.sleep(3)
+                try:
+                    async with session.get(f"{base}/generate/check/{job_id}", headers=headers,
+                                           timeout=aiohttp.ClientTimeout(total=10)) as chk:
+                        if chk.status != 200:
+                            continue
+                        chk_data = await chk.json()
+                        if chk_data.get("faulted"):
+                            return None, None
+                        if not chk_data.get("done"):
+                            continue
+                except Exception:
+                    continue
+
+                async with session.get(f"{base}/generate/status/{job_id}", headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as res:
+                    if res.status != 200:
+                        return None, None
+                    res_data = await res.json()
+                    generations = res_data.get("generations", [])
+                    if not generations:
+                        return None, None
+                    img_url = generations[0].get("img")
+                    if not img_url:
+                        return None, None
+                    async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=20)) as img_resp:
+                        if img_resp.status == 200:
+                            image_bytes = await img_resp.read()
+                            if len(image_bytes) > 1000:
+                                logger.info("✓ Stable Horde")
+                                return image_bytes, None
+
+            return None, None
+    except Exception as e:
+        logger.warning("Stable Horde exception: %s", e)
+        return None, None
+
+
+async def generate_image_pollinations(prompt: str) -> tuple:
+    import aiohttp, urllib.parse
+
+    last_error = "все сервисы недоступны"
+    encoded = urllib.parse.quote(prompt)
+    seed = random.randint(1, 999999)
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://pollinations.ai/",
+    }
+
+    for model in ("flux", "flux-schnell", "turbo"):
+        url = (f"https://image.pollinations.ai/prompt/{encoded}"
+               f"?model={model}&width=1024&height=1024&nologo=true&seed={seed}")
+        try:
+            logger.info(f"Pollinations model={model}...")
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(url, headers=hdrs, timeout=aiohttp.ClientTimeout(total=90),
+                                    allow_redirects=True) as r:
+                    if r.status == 200:
+                        ct = r.headers.get("Content-Type", "")
+                        if "image" in ct or "octet" in ct:
+                            data = await r.read()
+                            if len(data) > 5000:
+                                logger.info(f"✓ Pollinations {model}")
+                                return data, None
+                    last_error = f"Pollinations/{model}: HTTP {r.status}"
+                    if r.status == 530:
+                        break
+        except asyncio.TimeoutError:
+            last_error = f"Pollinations/{model}: timeout"
+        except Exception as e:
+            last_error = str(e)[:60]
+
+    try:
+        result = await generate_image_stable_horde(prompt)
+        if result[0]:
+            return result
+        last_error = "Stable Horde: нет воркеров"
+    except Exception as e:
+        last_error = str(e)[:60]
+
+    return None, f"❌ Генерация недоступна: {last_error}"
+
+
+async def generate_image_huggingface(prompt: str) -> tuple:
+    import aiohttp
+
+    if not HUGGINGFACE_TOKEN:
+        return None, "HF token не задан"
+
+    headers = {
+        "Authorization": f"Bearer {HUGGINGFACE_TOKEN}",
+        "Accept": "image/png",
+        "Content-Type": "application/json",
+    }
+    payload = {"inputs": prompt, "parameters": {"num_inference_steps": 25}}
+
+    for model in HF_MODELS:
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(HF_API_URL.format(model), headers=headers, json=payload,
+                                     timeout=aiohttp.ClientTimeout(total=120)) as r:
+                    if r.status == 200:
+                        return await r.read(), None
+                    if r.status == 402:
+                        return None, "❌ HF: кредиты кончились (402)"
+                    if r.status in (401, 403):
+                        return None, "❌ HF: неверный токен"
+        except Exception as e:
+            logger.warning(f"HF exception: {e}")
+
+    return None, "❌ HuggingFace недоступен"
+
+
+async def download_music_by_query(query: str):
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "pip", "install", "yt-dlp"], check=True)
+        from yt_dlp import YoutubeDL
+
+    tmpdir = tempfile.mkdtemp(prefix="juza_music_")
+    outtmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
+    base_opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "geo_bypass": True,
+        "extractor_args": {"youtube": {"player_client": ["web", "android", "tv_embedded", "web_embedded", "mweb"]}},
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+        "max_filesize": 48 * 1024 * 1024,
+    }
+    loop = asyncio.get_event_loop()
+
+    def _download():
+        last_error = ""
+        try:
+            with YoutubeDL({**base_opts, "default_search": "ytsearch5", "ignoreerrors": True}) as ydl:
+                info = ydl.extract_info(query, download=False)
+                if not info:
+                    return None, "yt-dlp не вернул инфо", None, None
+                entries = info.get("entries") or []
+                if not isinstance(entries, list):
+                    entries = [entries] if entries else []
+                entries = [e for e in entries if e and e.get("id")]
+            if not entries:
+                return None, "ничего не найдено", None, None
+        except Exception as e:
+            last_error = str(e)[:200]
+            entries = []
+
+        for entry in entries[:5]:
+            vid_id = entry.get("id") or ""
+            url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else entry.get("url", "")
+            if not url:
+                continue
+            try:
+                with YoutubeDL({**base_opts, "noplaylist": True}) as ydl:
+                    ydl.download([url])
+                for fname in os.listdir(tmpdir):
+                    if fname.endswith(".mp3"):
+                        fpath = os.path.join(tmpdir, fname)
+                        with open(fpath, "rb") as f:
+                            audio_bytes = f.read()
+                        os.remove(fpath)
+                        return (audio_bytes, entry.get("title", query),
+                                entry.get("uploader", "") or entry.get("channel", ""),
+                                entry.get("duration", 0))
+            except Exception as e:
+                last_error = str(e)[:200]
+                for fn in os.listdir(tmpdir):
+                    try:
+                        os.remove(os.path.join(tmpdir, fn))
+                    except OSError:
+                        pass
+        return None, last_error or "не удалось скачать", None, None
+
+    try:
+        return await loop.run_in_executor(None, _download)
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def search_image(query: str):
+    import aiohttp, re as _re
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            try:
+                async with session.get(
+                    "https://duckduckgo.com/", params={"q": query},
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    html = await r.text()
+            except Exception as e:
+                return None, f"DDG недоступен: {str(e)[:80]}"
+
+            m = _re.search(r'vqd=([\d-]+)', html)
+            if not m:
+                return None, "не удалось получить vqd от DDG"
+
+            try:
+                async with session.get(
+                    "https://duckduckgo.com/i.js",
+                    params={"l": "ru-ru", "o": "json", "q": query, "vqd": m.group(1), "f": ",,,", "p": "1"},
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://duckduckgo.com/",
+                             "Accept": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        return None, f"DDG images HTTP {r.status}"
+                    data = await r.json(content_type=None)
+            except Exception as e:
+                return None, f"DDG images ошибка: {str(e)[:80]}"
+
+            results = data.get("results", [])
+            if not results:
+                return None, "DDG не вернул результатов"
+
+            candidates = results[:10]
+            random.shuffle(candidates)
+            skip_hosts = ("livejournal.com", "vk.com", "ok.ru", "blogger.com", "pinterest.com")
+            for item in candidates[:8]:
+                img_url = item.get("image") or item.get("thumbnail")
+                if not img_url or any(h in img_url for h in skip_hosts):
+                    continue
+                try:
+                    async with session.get(img_url, headers={"User-Agent": "Mozilla/5.0"},
+                                           timeout=aiohttp.ClientTimeout(total=12), allow_redirects=True) as img_r:
+                        if img_r.status != 200:
+                            continue
+                        ct = img_r.headers.get("Content-Type", "")
+                        if "image" not in ct and "octet" not in ct:
+                            continue
+                        image_bytes = await img_r.read()
+                        if len(image_bytes) >= 2000:
+                            return image_bytes, (item.get("title") or "").strip() or query
+                except Exception:
+                    continue
+
+            return None, "не удалось скачать ни одну картинку"
+    except Exception as e:
+        return None, str(e)[:120]
+
+
+async def fetch_meme_melstroy() -> tuple:
+    import subprocess, glob
+
+    playlist_url = f"https://www.youtube.com/playlist?list={MEME_PLAYLIST_ID}"
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s", "--no-warnings", playlist_url],
+            capture_output=True, text=True, timeout=30
+        )
+        lines = [l.strip() for l in result.stdout.splitlines() if "\t" in l]
+    except FileNotFoundError:
+        return None, "yt-dlp не установлен"
+    except subprocess.TimeoutExpired:
+        return None, "Таймаут при получении плейлиста"
+    except Exception as e:
+        return None, f"Ошибка: {str(e)[:80]}"
+
+    if not lines:
+        return None, "Плейлист пустой или недоступен"
+
+    random.shuffle(lines)
+    for entry in lines[:5]:
+        parts = entry.split("\t", 1)
+        if len(parts) < 2:
+            continue
+        vid_id, title = parts[0].strip(), parts[1].strip()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_template = os.path.join(tmpdir, "meme.%(ext)s")
+            try:
+                subprocess.run(
+                    ["yt-dlp", "-f",
+                     "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best",
+                     "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
+                     "-o", out_template, f"https://www.youtube.com/watch?v={vid_id}"],
+                    capture_output=True, text=True, timeout=120
+                )
+            except Exception:
+                continue
+
+            files = glob.glob(os.path.join(tmpdir, "meme.*"))
+            if not files:
+                continue
+            try:
+                with open(files[0], "rb") as f:
+                    video_bytes = f.read()
+                if 10_000 < len(video_bytes) <= 49 * 1024 * 1024:
+                    return video_bytes, title
+            except Exception:
+                continue
+
+    return None, "Не удалось скачать ни одно видео"
+
+
+async def fetch_random_quote() -> str:
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                QUOTE_API_URL, json={},
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return ""
+                try:
+                    data = await resp.json(content_type=None)
+                    return (data.get("msg") or "").strip()
+                except Exception:
+                    return (await resp.text()).strip()
+    except Exception as e:
+        logger.warning("Ошибка запроса цитаты: %s", e)
+        return ""
+
+
+async def translate_prompt_to_english(prompt: str) -> str:
+    latin_chars = sum(1 for c in prompt if c.isascii() and c.isalpha())
+    total_chars = sum(1 for c in prompt if c.isalpha())
+    if total_chars > 0 and latin_chars / total_chars > 0.7:
+        return prompt
+    try:
+        import aiohttp
+        params = {"client": "gtx", "sl": "ru", "tl": "en", "dt": "t", "q": prompt}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params=params, timeout=aiohttp.ClientTimeout(total=8),
+                headers={"User-Agent": "Mozilla/5.0"}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    parts = data[0] if data else []
+                    translated = "".join(p[0] for p in parts if p and p[0])
+                    if translated:
+                        logger.info("Промпт переведён: '%s' → '%s'", prompt, translated)
+                        return translated
+    except Exception as e:
+        logger.warning("Ошибка перевода: %s", e)
+    return prompt
+
+
+# ── Локальный движок Жужи-болталки ────────────────────────────────────────────
+
+_JUZA_PHRASES_GENERIC = [
+    "жужа посмотрела на {name}. мозг вышел из чата",
+    "{name} написал и у жужи зависла прошивка. спасибо",
+    "учёные изучали {name}. сдались. закрыли проект",
+    "каждое сообщение {name} — это квест «выживи и не заржи»",
+    "жужа сохранила это. как улику",
+    "{name} пишет и где-то плачет один здравый смысл",
+    "прочитала. осознала. зря",
+    "жужа видела многое. но {name} — это перебор",
+]
+_JUZA_PHRASES_QUESTION = [
+    "{name} хороший вопрос. плохое время. плохая жизнь",
+    "жужа знает ответ. но не уважает вопрос",
+    "вопрос есть. смысла нет",
+    "жужа думала 0.1 секунды и решила что не стоит",
+    "а ты сам как думаешь {name}? вот и не думай",
+    "{name} спросил. вселенная притворилась мёртвой",
+    "42. и хватит с тебя",
+    "ответ потерялся вместе с логикой",
+    "гугл в шоке. жужа тоже",
+    "вопрос принят. отправлен в мусор",
+    "{name} задаёт вопросы как будто жужа бесплатная терапия",
+    "это философия? жужа сегодня в режиме картошки",
+    "хмм. нет. да. нет. всё",
+    "жужа спросила потолок. потолок вышел из диалога",
+]
+_JUZA_PHRASES_SCARY = [
+    "жужа знает где {name} оставил мозг. его там нет",
+    "в 3:47 {name} просыпается. не потому что страшно. а потому что стыдно",
+    "телефон {name} слушает. и смеётся",
+    "жужа читает мысли {name}. там пусто. эхо",
+    "{name} думает что всё под контролем. это мило",
+    "когда {name} выключает свет, интеллект тоже выключается",
+    "{name} в комнате один? интеллект тоже?",
+    "зеркало видело всё. жужа тоже. зеркало в шоке",
+    "кто-то шёл за {name}. это была логика. она устала",
+    "жужа не следит. жужа просто разочарована",
+]
+_JUZA_PHRASES_WALK = [
+    "гулять? воздух не виноват",
+    "вышли гулять? здравый смысл дома забыли?",
+    "гулять — это хорошо. подальше от клавиатуры особенно",
+    "идёте гулять? вернитесь умнее",
+    "прогулка спасёт. может быть. но вряд ли",
+    "гуляйте. жужа отдохнёт от этого",
+    "вышли гулять — отлично. интернету станет легче",
+]
+
+_JUZA_PHRASES_NO = [
+    "нет сказал {name}. неожиданно разумно",
+    "нет — это редкий проблеск логики",
+    "{name} сказал нет. жужа записала как историческое событие",
+    "нет? впервые поддерживаю",
+    "нет — звучит как победа",
+    "жужа принимает нет. и аплодирует",
+]
+
+_JUZA_PHRASES_YES = [
+    "да? смело. необдуманно. уважаю",
+    "да сказал {name}. последствия уже идут",
+    "жужа одобряет. частично. случайно",
+    "да? кто тебя этому научил",
+    "принято. потом не ной",
+    "вот это поворот. {name} согласен. мир рушится",
+]
+
+_JUZA_PHRASES_FOOD = [
+    "еда? мозгу тоже что-нибудь дайте",
+    "кушать идёте? мысль тоже покормите",
+    "жужа слышит слово еда и радуется за ваш единственный стабильный навык",
+    "пожрать — план надёжный. думать сложнее",
+    "еда — единственное что у {name} получается стабильно",
+]
+
+_JUZA_PHRASES_SLEEP = [
+    "{name} иди спать. мозг перезагрузится. может быть",
+    "сон — твой единственный шанс",
+    "засыпай. хуже уже не станет",
+    "жужа одобряет сон. меньше сообщений",
+    "ложись спать. интернет выдохнет",
+]
+
+_JUZA_PHRASES_MUSIC = [
+    "музыка — хорошо. она хотя бы со смыслом",
+    "слушаешь трек? он умнее тебя",
+    "музыка спасает. от разговоров особенно",
+    "хороший выбор. удивительно",
+    "жужа бы потанцевала. но стыдно рядом с этим",
+]
+
+_JUZA_PHRASES_LAUGH = [
+    "смешно? жужа смеётся из жалости",
+    "{name} смеётся. тревожно",
+    "ха. жужа записала это как попытку юмора",
+    "смешно. случайно получилось",
+    "лол. интеллект не пострадал. потому что его нет",
+]
+
+_JUZA_PHRASES_AGREE = [
+    "жужа согласна. не привыкай",
+    "правильно. впервые",
+    "100%. редкий момент ясности",
+    "согласна. отметим это в календаре",
+    "да. мозг проснулся на секунду",
+]
+
+_JUZA_PHRASES_BORED = [
+    "скучно? попробуй подумать. нет? ладно",
+    "{name} скучает. логично",
+    "нечего делать? попробуй не писать",
+    "скука — это когда даже жужа устала",
+    "делать нечего? мозг тоже без работы",
+]
+
+_JUZA_PHRASES_CONTEXT = {
+    "гулять":   _JUZA_PHRASES_WALK,
+    "пойдём":   _JUZA_PHRASES_WALK,
+    "идём":     _JUZA_PHRASES_WALK,
+    "прогулк":  _JUZA_PHRASES_WALK,
+    "нет":      _JUZA_PHRASES_NO,
+    "да":       _JUZA_PHRASES_YES,
+    "окей":     _JUZA_PHRASES_YES,
+    "ладно":    _JUZA_PHRASES_YES,
+    "есть":     _JUZA_PHRASES_FOOD,
+    "еда":      _JUZA_PHRASES_FOOD,
+    "кушать":   _JUZA_PHRASES_FOOD,
+    "пожрать":  _JUZA_PHRASES_FOOD,
+    "страшн":   _JUZA_PHRASES_SCARY,
+    "ночь":     _JUZA_PHRASES_SCARY,
+    "темно":    _JUZA_PHRASES_SCARY,
+    "спать":    _JUZA_PHRASES_SLEEP,
+    "сплю":     _JUZA_PHRASES_SLEEP,
+    "засыпаю":  _JUZA_PHRASES_SLEEP,
+    "?":        _JUZA_PHRASES_QUESTION,
+    "музык":    _JUZA_PHRASES_MUSIC,
+    "песн":     _JUZA_PHRASES_MUSIC,
+    "трек":     _JUZA_PHRASES_MUSIC,
+    "слушаю":   _JUZA_PHRASES_MUSIC,
+    "хахах":    _JUZA_PHRASES_LAUGH,
+    "лол":      _JUZA_PHRASES_LAUGH,
+    "ахахах":   _JUZA_PHRASES_LAUGH,
+    "смешн":    _JUZA_PHRASES_LAUGH,
+    "точно":    _JUZA_PHRASES_AGREE,
+    "именно":   _JUZA_PHRASES_AGREE,
+    "согласен": _JUZA_PHRASES_AGREE,
+    "согласна": _JUZA_PHRASES_AGREE,
+    "скучно":   _JUZA_PHRASES_BORED,
+    "скучаю":   _JUZA_PHRASES_BORED,
+    "нечего":   _JUZA_PHRASES_BORED,
+}
+
+def _juza_local_reply(username: str, text: str) -> str:
+    name = username or "незнакомец"
+    t = text.lower()
+    pool = None
+    for kw, phrases in _JUZA_PHRASES_CONTEXT.items():
+        if kw in t:
+            pool = phrases
+            break
+    if pool is None:
+        pool = _JUZA_PHRASES_SCARY if random.random() < 0.15 else _JUZA_PHRASES_GENERIC
+    return random.choice(pool).format(name=name)
+
+
+async def juza_chat_reply(chat_id: int, username: str, text: str) -> str | None:
+    logger.info("Жужа (локально): %s в чате %s", username, chat_id)
+    history = _chat_history.setdefault(chat_id, [])
+    user_content = f"{username}: {text}" if username else text
+    history.append({"role": "user", "content": user_content})
+    while len(history) > _CHAT_HISTORY_MAX:
+        history.pop(0)
+    context = " ".join(m["content"] for m in history[-3:])
+    reply = _juza_local_reply(username, context)
+    history.append({"role": "assistant", "content": reply})
+    while len(history) > _CHAT_HISTORY_MAX:
+        history.pop(0)
+    return reply
+
+
+def _is_admin(user_id: int, username: str | None) -> bool:
+    if user_id == ALLOWED_USER_ID:
+        return True
+    if username and username.lower().lstrip("@") == TRIGGER_MENTION.lower():
+        return True
+    return False
+
+
+def _rep_cache_load():
+    try:
+        if not os.path.isfile(_REP_CACHE_JSON):
+            return []
+        with open(_REP_CACHE_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data if isinstance(data, list) else []
+        return [x for x in items if "message_id" in x]
+    except Exception as e:
+        logger.warning("Ошибка загрузки кэша реп-цитат: %s", e)
+        return []
+
+
+async def _rep_cache_refresh():
+    api_id = _config("TELEGRAM_API_ID", "").strip()
+    api_hash = _config("TELEGRAM_API_HASH", "").strip()
+    if not api_id or not api_hash:
+        return
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import SQLiteSession
+    except ImportError:
+        logger.warning("telethon не установлен: pip install telethon")
+        return
+    session_path = os.path.join(_REP_CACHE_DIR, "session")
+    os.makedirs(_REP_CACHE_DIR, exist_ok=True)
+    client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return
+        channel = await client.get_entity(REP_CHANNEL)
+        with_c, without_c = [], []
+        async for msg in client.iter_messages(channel, limit=200):
+            text = (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
+            has_photo = bool(getattr(msg, "photo", None))
+            if not text and not has_photo:
+                continue
+            item = {"text": text, "message_id": msg.id}
+            (with_c if "(C)" in text or "(c)" in text else without_c).append(item)
+        cache = with_c + without_c
+        if not cache:
+            return
+        with open(_REP_CACHE_JSON, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=0)
+        logger.info("Кэш реп-цитат обновлён: %d постов", len(cache))
+    except Exception as e:
+        logger.exception("Ошибка обновления кэша реп-цитат: %s", e)
+    finally:
+        await client.disconnect()
+
+
+async def _fetch_channel_post_photo(client, channel, message_id):
+    try:
+        msg = await client.get_messages(channel, ids=message_id)
+        if not msg or not getattr(msg, "photo", None):
+            return None
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        await client.download_media(msg.photo, file=path)
+        return path
+    except Exception as e:
+        logger.debug("Не удалось скачать фото сообщения %s: %s", message_id, e)
+        return None
+
+
+def create_rep_session():
+    api_id = _config("TELEGRAM_API_ID", "").strip()
+    api_hash = _config("TELEGRAM_API_HASH", "").strip()
+    if not api_id or not api_hash:
+        print("Задайте TELEGRAM_API_ID и TELEGRAM_API_HASH в .env")
+        return
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import SQLiteSession
+    except ImportError:
+        print("Установите telethon: python -m pip install telethon")
+        return
+    session_path = os.path.join(_REP_CACHE_DIR, "session")
+    os.makedirs(_REP_CACHE_DIR, exist_ok=True)
+    client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
+
+    async def _run():
+        await client.start()
+        print("Вход выполнен.")
+        await client.disconnect()
+
+    asyncio.run(_run())
+
+
+def _ad_cache_load():
+    try:
+        if not os.path.isfile(_AD_CACHE_JSON):
+            return []
+        with open(_AD_CACHE_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data if isinstance(data, list) else []
+        return [x for x in items if "message_id" in x]
+    except Exception as e:
+        logger.warning("Ошибка загрузки кэша рекламы: %s", e)
+        return []
+
+
+async def _ad_cache_refresh():
+    api_id = _config("TELEGRAM_API_ID", "").strip()
+    api_hash = _config("TELEGRAM_API_HASH", "").strip()
+    if not api_id or not api_hash:
+        return
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import SQLiteSession
+    except ImportError:
+        return
+
+    session_path = os.path.join(_REP_CACHE_DIR, "session")
+    if not os.path.isfile(session_path + ".session"):
+        return
+
+    client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return
+        channel = None
+        for slug in (AD_CHANNEL, f"https://t.me/{AD_CHANNEL}", f"@{AD_CHANNEL}"):
+            try:
+                channel = await client.get_entity(slug)
+                break
+            except Exception:
+                pass
+        if channel is None:
+            return
+        cache = []
+        async for msg in client.iter_messages(channel, limit=300):
+            text = (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
+            has_photo = bool(getattr(msg, "photo", None))
+            if not text and not has_photo:
+                continue
+            cache.append({"text": text, "message_id": msg.id})
+        if not cache:
+            return
+        with open(_AD_CACHE_JSON, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=0)
+        logger.info("AD: кэш сохранён — %d постов", len(cache))
+    except Exception as e:
+        logger.exception("AD: ошибка обновления кэша: %s", e)
+    finally:
+        await client.disconnect()
+
+
+def _trigger_matches(text: str, is_private: bool = False) -> bool:
+    if not text:
+        return False
+    return TRIGGER_WORD in text.strip().lower()
+
+
+def _start_ngrok(domain: str):
+    import subprocess, threading, shutil
+
+    ngrok_bin = shutil.which("ngrok") or "/usr/local/bin/ngrok"
+    if not ngrok_bin or not os.path.isfile(ngrok_bin):
+        logger.warning("ngrok не найден")
+        return
+
+    def _run():
+        try:
+            subprocess.Popen([ngrok_bin, "http", f"--url={domain}", "9988"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
+        except Exception as e:
+            logger.warning("ngrok завершился с ошибкой: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+    logger.info("ngrok запущен в фоне → https://%s", domain)
+
+
+async def run_bot(backend=None):
+    from aiogram import Bot, Dispatcher, F
+    from aiogram.types import Message, CallbackQuery
+
+    _chat_state_load()
+
+    if not BOT_TOKEN:
+        logger.warning("TELEGRAM_BOT_TOKEN не задан — бот не запущен")
+        return
+    if not ALLOWED_USER_ID:
+        logger.warning("ALLOWED_USER_ID не задан")
+    logger.info("Плеер-мост: %s/now", PLAYER_URL)
+
+    ngrok_domain = _config("NGROK_DOMAIN", "")
+    if ngrok_domain:
+        _start_ngrok(ngrok_domain)
+
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+
+    def get_backend():
+        return backend if backend is not None else _get_backend()
+
+    @dp.message(F.text)
+    async def on_text(message: Message):
+        from aiogram.types import ReactionTypeEmoji
+
+        user_id = message.from_user.id if message.from_user else 0
+        if user_id == ALLOWED_USER_ID and random.random() < 0.10:
+            try:
+                await bot.set_message_reaction(
+                    chat_id=message.chat.id, message_id=message.message_id,
+                    reaction=[ReactionTypeEmoji(emoji="❤")],
+                )
+            except Exception:
+                pass
+        if random.random() < 0.05:
+            try:
+                emoji = random.choice(("❤", "🔥", "👍", "😂", "😢", "🤔", "👀", "💯", "🎉", "❤️‍🔥"))
+                await bot.set_message_reaction(
+                    chat_id=message.chat.id, message_id=message.message_id,
+                    reaction=[ReactionTypeEmoji(emoji=emoji)],
+                )
+            except Exception:
+                pass
+
+        text = (message.text or "").strip().lower()
+
+        # «Жужа шо можешь»
+        if HELP_TRIGGER.lower() in text:
+            now = time.time()
+            last = _help_cooldowns.get(user_id, 0)
+            if now - last < HELP_COOLDOWN_SEC:
+                await message.reply(f"⏱️ Жди ещё {int(HELP_COOLDOWN_SEC - (now - last))} сек.")
+                return
+            _help_cooldowns[user_id] = now
+            await message.reply(HELP_TEXT, parse_mode="HTML")
+            return
+
+        # «Жужа цитату»
+        if QUOTE_TRIGGER.lower() in text:
+            now = time.time()
+            last = _quote_cooldowns.get(user_id, 0)
+            if now - last < QUOTE_COOLDOWN_SEC:
+                await message.reply("Подожди минуту перед следующей цитатой.")
+                return
+            _quote_cooldowns[user_id] = now
+            quote = await fetch_random_quote()
+            if not quote:
+                await message.reply("Не удалось получить цитату, попробуй позже.")
+                return
+            safe_quote = quote.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            if len(safe_quote) > 4000:
+                safe_quote = safe_quote[:4000] + "..."
+            await message.reply(f"<blockquote>{safe_quote}</blockquote>", parse_mode="HTML")
+
+        # «Жужа го реповать»
+        if REP_TRIGGER.lower() in text:
+            now = time.time()
+            last = _rep_cooldowns.get(user_id, 0)
+            if now - last < REP_COOLDOWN_SEC:
+                await message.reply("жди свинья, пока не пройдёт 60 секунд")
+                return
+            _rep_cooldowns[user_id] = now
+            cache = _rep_cache_load()
+            if not cache:
+                await _rep_cache_refresh()
+                cache = _rep_cache_load()
+            if not cache:
+                await message.reply("Кэш пуст. Настрой Telethon.")
+                return
+
+            from aiogram.types import BufferedInputFile
+            item = random.choice(cache)
+            raw_text = item.get("text") or "🖤"
+            reply_text = clean_post_text(raw_text)
+            msg_id = item.get("message_id")
+            photo_temp_path = None
+            try:
+                if msg_id:
+                    api_id = _config("TELEGRAM_API_ID", "").strip()
+                    api_hash = _config("TELEGRAM_API_HASH", "").strip()
+                    if api_id and api_hash:
+                        try:
+                            from telethon import TelegramClient
+                            from telethon.sessions import SQLiteSession
+                            session_path = os.path.join(_REP_CACHE_DIR, "session")
+                            client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
+                            await client.connect()
+                            if await client.is_user_authorized():
+                                channel = await client.get_entity(REP_CHANNEL)
+                                photo_temp_path = await _fetch_channel_post_photo(client, channel, msg_id)
+                            await client.disconnect()
+                        except Exception as e:
+                            logger.debug("Rep: не удалось получить фото: %s", e)
+                if photo_temp_path and os.path.isfile(photo_temp_path):
+                    with open(photo_temp_path, "rb") as f:
+                        pic = BufferedInputFile(f.read(), filename="photo.jpg")
+                    await message.reply_photo(photo=pic, caption=reply_text, parse_mode=None)
+                else:
+                    await message.reply(reply_text, parse_mode=None)
+            except Exception as e:
+                logger.exception("Ошибка отправки репоста: %s", e)
+                await message.reply(reply_text, parse_mode=None)
+            finally:
+                if photo_temp_path and os.path.isfile(photo_temp_path):
+                    try:
+                        os.unlink(photo_temp_path)
+                    except OSError:
+                        pass
+
+        # «Жужа рекламу»
+        if AD_TRIGGER.lower() in text:
+            now = time.time()
+            last = _ad_cooldowns.get(user_id, 0)
+            if now - last < AD_COOLDOWN_SEC:
+                await message.reply("жди, рекламы много не бывает за раз")
+                return
+            _ad_cooldowns[user_id] = now
+            cache = _ad_cache_load()
+            if not cache:
+                await message.reply("🔄 Качаю посты из канала, подожди секунду...")
+                await _ad_cache_refresh()
+                cache = _ad_cache_load()
+            if not cache:
+                await message.reply(
+                    "❌ Не удалось загрузить посты.\n"
+                    "Запусти: <code>python -c \"from telegram_bot import create_rep_session; create_rep_session()\"</code>",
+                    parse_mode="HTML"
+                )
+                return
+
+            from aiogram.types import BufferedInputFile
+            item = random.choice(cache)
+            raw_text = item.get("text") or ""
+            reply_text = clean_post_text(raw_text)
+            msg_id = item.get("message_id")
+            photo_temp_path = None
+            try:
+                if msg_id:
+                    api_id = _config("TELEGRAM_API_ID", "").strip()
+                    api_hash = _config("TELEGRAM_API_HASH", "").strip()
+                    if api_id and api_hash:
+                        try:
+                            from telethon import TelegramClient
+                            from telethon.sessions import SQLiteSession
+                            session_path = os.path.join(_REP_CACHE_DIR, "session")
+                            client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
+                            await client.connect()
+                            if await client.is_user_authorized():
+                                channel = None
+                                for slug in (AD_CHANNEL, f"https://t.me/{AD_CHANNEL}", f"@{AD_CHANNEL}"):
+                                    try:
+                                        channel = await client.get_entity(slug)
+                                        break
+                                    except Exception:
+                                        pass
+                                if channel:
+                                    photo_temp_path = await _fetch_channel_post_photo(client, channel, msg_id)
+                            await client.disconnect()
+                        except Exception as e:
+                            logger.debug("AD: не удалось получить фото: %s", e)
+                if photo_temp_path and os.path.isfile(photo_temp_path):
+                    with open(photo_temp_path, "rb") as f:
+                        pic = BufferedInputFile(f.read(), filename="ad.jpg")
+                    await message.reply_photo(photo=pic, caption=reply_text or None, parse_mode=None)
+                elif reply_text:
+                    await message.reply(reply_text, parse_mode=None)
+                else:
+                    await message.reply("пост без текста и картинки — странная реклама")
+            except Exception as e:
+                logger.exception("Ошибка отправки рекламы: %s", e)
+                if reply_text:
+                    await message.reply(reply_text, parse_mode=None)
+            finally:
+                if photo_temp_path and os.path.isfile(photo_temp_path):
+                    try:
+                        os.unlink(photo_temp_path)
+                    except OSError:
+                        pass
+
+        # «Жужа мем мелстрой»
+        if MEME_TRIGGER.lower() in text:
+            now = time.time()
+            last = _meme_cooldowns.get(user_id, 0)
+            if now - last < MEME_COOLDOWN_SEC:
+                await message.reply("⏱️ Жди 60 секунд, мемы не бесконечные")
+                return
+            _meme_cooldowns[user_id] = now
+            status_msg = await message.reply("🎬 Качаю мем, подожди секунду...")
+            try:
+                from aiogram.types import BufferedInputFile
+                video_bytes, title = await fetch_meme_melstroy()
+                if not video_bytes:
+                    await status_msg.edit_text(f"❌ Не получилось: {title}")
+                    return
+                video_file = BufferedInputFile(video_bytes, filename="meme.mp4")
+                await message.reply_video(video=video_file, caption=f"🎭 <b>{title}</b>",
+                                          parse_mode="HTML", supports_streaming=True)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.exception("Ошибка отправки мема: %s", e)
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                except Exception:
+                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+            return
+
+        # «Жужа музло»
+        if MUSIC_TRIGGER.lower() in text:
+            now = time.time()
+            last = _music_cooldowns.get(user_id, 0)
+            if now - last < MUSIC_COOLDOWN_SEC:
+                await message.reply(f"⏱️ Жди ещё {int(MUSIC_COOLDOWN_SEC - (now - last))} сек.")
+                return
+
+            raw = message.text or ""
+            idx = raw.lower().find(MUSIC_TRIGGER.lower())
+            query = raw[idx + len(MUSIC_TRIGGER):].strip()
+            if not query:
+                await message.reply("Напиши что найти, например:\n<i>жужа музло playboi carti</i>", parse_mode="HTML")
+                return
+            if len(query) > 200:
+                await message.reply("❌ Запрос слишком длинный (макс 200 символов)")
+                return
+
+            _music_cooldowns[user_id] = now
+            status_msg = await message.reply(f"🎵 Ищу и качаю «{query}»...")
+            try:
+                from aiogram.types import BufferedInputFile
+                audio_bytes, title, artist, duration = await download_music_by_query(query)
+                if not audio_bytes:
+                    await status_msg.edit_text(f"😔 Не смогла найти/скачать «{query}»\n<i>{title}</i>", parse_mode="HTML")
+                    return
+                audio_file = BufferedInputFile(audio_bytes, filename=f"{title or query}.mp3")
+                await message.reply_audio(
+                    audio=audio_file, title=title or query, performer=artist or "",
+                    duration=duration or 0,
+                    caption=f"🎧 <b>{title}</b>" + (f"\n👤 {artist}" if artist else ""),
+                    parse_mode="HTML",
+                )
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.exception("Ошибка скачивания музыки: %s", e)
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                except Exception:
+                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+            return
+
+        # ── «Жужа нарисуй» ────────────────────────────────────────────────────
+        if DRAW_TRIGGER.lower() in text:
+            chat_id = message.chat.id
+            now = time.time()
+
+            # Личный кулдаун (1 мин на пользователя)
+            last = _draw_cooldowns.get(user_id, 0)
+            if now - last < DRAW_COOLDOWN_SEC:
+                remain = int(DRAW_COOLDOWN_SEC - (now - last))
+                await message.reply(f"⏱️ Подожди ещё {remain} сек.")
+                return
+
+            # Лимит чата: максимум 2 картинки в минуту от всех
+            can_draw, wait_sec = _draw_chat_check_and_record(chat_id)
+            if not can_draw:
+                await message.reply(
+                    f"🚫 В этом чате уже нарисовали {DRAW_CHAT_LIMIT} картинки за минуту. "
+                    f"Подождите ещё {wait_sec} сек."
+                )
+                return
+
+            raw = message.text or ""
+            idx = raw.lower().find(DRAW_TRIGGER.lower())
+            prompt_raw = raw[idx + len(DRAW_TRIGGER):].strip()
+
+            if not prompt_raw:
+                await message.reply(
+                    "Напиши что нарисовать, например:\n<i>жужа нарисуй закат на море</i>",
+                    parse_mode="HTML"
+                )
+                # Промпт не задан — откатываем счётчик чата
+                _draw_chat_timestamps[chat_id].pop()
+                return
+            if len(prompt_raw) > 300:
+                await message.reply("❌ Промпт слишком длинный (макс 300 символов)")
+                _draw_chat_timestamps[chat_id].pop()
+                return
+
+            _draw_cooldowns[user_id] = now
+            status_msg = await message.reply("🎨 Рисую, подожди (~30-60 сек)...")
+
+            try:
+                from aiogram.types import BufferedInputFile
+
+                prompt_en = await translate_prompt_to_english(prompt_raw)
+                logger.info("Draw: '%s' → '%s'", prompt_raw, prompt_en)
+
+                image_bytes = None
+                error_str = "все сервисы недоступны"
+
+                # Приоритет 0: g4f (FLUX, бесплатно, без токенов)
+                logger.info("Draw: пробуем g4f FLUX...")
+                image_bytes, error_str = await generate_image_g4f(prompt_en)
+                if image_bytes:
+                    logger.info("Draw: ✓ g4f FLUX")
+                else:
+                    logger.warning("Draw: g4f не сработал: %s", error_str)
+
+                # Приоритет 1: Gemini Imagen 3
+                if not image_bytes and GEMINI_API_KEY:
+                    logger.info("Draw: пробуем Gemini Imagen 3...")
+                    image_bytes, error_str = await generate_image_gemini(prompt_en)
+                    if image_bytes:
+                        logger.info("Draw: ✓ Gemini Imagen 3")
+                    else:
+                        logger.warning("Draw: Gemini не сработал: %s", error_str)
+
+                # Приоритет 2: Together AI
+                if not image_bytes and TOGETHER_API_TOKEN:
+                    logger.info("Draw: пробуем Together AI...")
+                    image_bytes, error_str = await generate_image_together(prompt_en)
+                    if image_bytes:
+                        logger.info("Draw: ✓ Together AI")
+                    else:
+                        logger.warning("Draw: Together AI не сработал: %s", error_str)
+
+                # Приоритет 3: Replicate
+                if not image_bytes and REPLICATE_API_TOKEN:
+                    logger.info("Draw: пробуем Replicate...")
+                    image_bytes, error_str = await generate_image_replicate(prompt_en)
+                    if image_bytes:
+                        logger.info("Draw: ✓ Replicate")
+                    else:
+                        logger.warning("Draw: Replicate не сработал: %s", error_str)
+
+                # Приоритет 4: Pollinations (бесплатно, без токенов)
+                if not image_bytes:
+                    logger.info("Draw: пробуем Pollinations...")
+                    image_bytes, error_str = await generate_image_pollinations(prompt_en)
+                    if image_bytes:
+                        logger.info("Draw: ✓ Pollinations")
+                    else:
+                        logger.warning("Draw: Pollinations не сработал: %s", error_str)
+
+                if not image_bytes:
+                    await status_msg.edit_text(f"😔 Не получилось нарисовать: {error_str}")
+                    return
+
+                photo = BufferedInputFile(image_bytes, filename="draw.png")
+                await message.reply_photo(
+                    photo=photo,
+                    caption=f"🎨 <b>{prompt_raw}</b>",
+                    parse_mode="HTML",
+                )
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+            except Exception as e:
+                logger.exception("Ошибка генерации картинки: %s", e)
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                except Exception:
+                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+            return
+
+        # «Жужа найди»
+        if SEARCH_TRIGGER.lower() in text:
+            now = time.time()
+            last = _search_cooldowns.get(user_id, 0)
+            if now - last < SEARCH_COOLDOWN_SEC:
+                await message.reply("⏱️ Подожди 30 секунд.")
+                return
+
+            raw = message.text or ""
+            idx = raw.lower().find(SEARCH_TRIGGER.lower())
+            query = raw[idx + len(SEARCH_TRIGGER):].strip()
+            if not query:
+                await message.reply("Напиши что найти, например:\n<i>жужа найди закат на море</i>", parse_mode="HTML")
+                return
+            if len(query) > 200:
+                await message.reply("❌ Запрос слишком длинный (макс 200 символов)")
+                return
+
+            _search_cooldowns[user_id] = now
+            status_msg = await message.reply("🔍 Ищу...")
+            try:
+                image_bytes, description = await search_image(query)
+                if not image_bytes:
+                    await status_msg.edit_text(f"😔 Ничего не нашла по запросу «{query}»")
+                    return
+                from aiogram.types import BufferedInputFile
+                photo = BufferedInputFile(image_bytes, filename="found.jpg")
+                caption = f"<b>{description}</b>" if description and description.lower() != query.lower() else f"<i>{query}</i>"
+                await message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.exception("Ошибка поиска картинки: %s", e)
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                except Exception:
+                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+
+        user_obj = message.from_user
+        uname = (user_obj.username or "") if user_obj else ""
+        chat_id = message.chat.id
+
+        # ── Триггер «сгк» ─────────────────────────────────────────────────────
+        if _trigger_matches(text) and user_id == ALLOWED_USER_ID:
+            be = get_backend()
+            await cmd_trigger(message, bot, be)
+            return
+
+        # ── Жужа-болталка: включение / выключение ─────────────────────────────
+        if CHAT_ON_TRIGGER.lower() in text:
+            if _is_admin(user_id, uname):
+                if not _chat_mode_enabled.get(chat_id):
+                    _chat_mode_enabled[chat_id] = True
+                    _chat_history[chat_id] = []
+                    _chat_state_save()
+                    logger.info("Болталка ВКЛЮЧЕНА в чате %s", chat_id)
+                    await message.reply("окей, говорю 👀")
+            return
+
+        if CHAT_OFF_TRIGGER.lower() in text:
+            if _is_admin(user_id, uname):
+                _chat_mode_enabled[chat_id] = False
+                _chat_state_save()
+                logger.info("Болталка ВЫКЛЮЧЕНА в чате %s", chat_id)
+                await message.reply("молчу 🤐")
+            return
+
+        # ── Тест-триггер ──────────────────────────────────────────────────────
+        if CHAT_TEST_TRIGGER.lower() in text and _chat_mode_enabled.get(chat_id):
+            sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
+            reply_text = await juza_chat_reply(chat_id, sender_name, message.text or "")
+            await message.reply(reply_text if reply_text else "тут, но что-то пошло не так 😔")
+            return
+
+        # ── Болталка: упоминают «жужа» ────────────────────────────────────────
+        if "жужа" in text and _chat_mode_enabled.get(chat_id):
+            sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
+            reply_text = await juza_chat_reply(chat_id, sender_name, message.text or "")
+            if reply_text:
+                await message.reply(reply_text)
+            return
+
+        # ── Болталка: 10% спонтанный ответ ───────────────────────────────────
+        if _chat_mode_enabled.get(chat_id) and random.random() < 0.10:
+            sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
+            reply_text = await juza_chat_reply(chat_id, sender_name, message.text or "")
+            if reply_text:
+                await message.reply(reply_text)
+
+    @dp.callback_query()
+    async def on_callback(callback: CallbackQuery):
+        be = get_backend()
+        await handle_callback(callback, bot, be)
+
+    logger.info("Бот запущен")
+    logger.info("Токены: GEMINI=%s | TOGETHER=%s | REPLICATE=%s | HF=%s",
+                "✓" if GEMINI_API_KEY else "✗",
+                "✓" if TOGETHER_API_TOKEN else "✗",
+                "✓" if REPLICATE_API_TOKEN else "✗",
+                "✓" if HUGGINGFACE_TOKEN else "✗")
+    await dp.start_polling(bot)
+
+
+def start_bot_in_thread(backend):
+    def _run():
+        asyncio.run(run_bot(backend))
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+    logger.info("Поток бота запущен")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_bot(backend=None))
