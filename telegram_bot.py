@@ -940,7 +940,7 @@ async def download_music_by_query(query: str):
             try:
                 out_template = os.path.join(tmpdir, "track.%(ext)s")
                 dl_result = _sp.run(
-                    ["yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio/best",
+                    ["yt-dlp", "-f", "bestaudio/best",
                      "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
                      "--no-playlist", "--no-warnings", "--max-filesize", "48m",
                      "-o", out_template, url],
