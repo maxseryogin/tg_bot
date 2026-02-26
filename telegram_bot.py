@@ -903,7 +903,7 @@ async def download_music_by_query(query: str):
         import subprocess as _sp
         last_error = ""
 
-        # Шаг 1: ищем через subprocess yt-dlp (как мелстрой — надёжнее)
+        # Шаг 1: ищем через subprocess yt-dlp
         entries_to_try = []
         try:
             result = _sp.run(
@@ -911,6 +911,8 @@ async def download_music_by_query(query: str):
                  "--no-warnings", "--default-search", "ytsearch5", query],
                 capture_output=True, text=True, timeout=30
             )
+            logger.info("yt-dlp search stdout: %r", result.stdout[:300])
+            logger.info("yt-dlp search stderr: %r", result.stderr[:300])
             for line in result.stdout.splitlines():
                 parts = line.strip().split("\t")
                 if len(parts) >= 2 and parts[0].strip():
@@ -922,32 +924,43 @@ async def download_music_by_query(query: str):
                     except Exception:
                         duration = 0
                     entries_to_try.append((f"https://www.youtube.com/watch?v={vid_id}", title, uploader, duration))
+            if not entries_to_try and result.stderr:
+                last_error = result.stderr.strip()[-300:]
         except Exception as e:
-            last_error = str(e)[:200]
+            last_error = str(e)[:300]
+            logger.error("yt-dlp search exception: %s", last_error)
 
         if not entries_to_try:
             return None, last_error or "ничего не найдено", None, None
+
+        logger.info("yt-dlp found %d entries, first: %s", len(entries_to_try), entries_to_try[0][1])
 
         # Шаг 2: скачиваем первый успешный через subprocess
         for url, title, uploader, duration in entries_to_try[:5]:
             try:
                 out_template = os.path.join(tmpdir, "track.%(ext)s")
-                _sp.run(
+                dl_result = _sp.run(
                     ["yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio/best",
                      "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
                      "--no-playlist", "--no-warnings", "--max-filesize", "48m",
                      "-o", out_template, url],
                     capture_output=True, text=True, timeout=120
                 )
-                for fname in os.listdir(tmpdir):
+                logger.info("yt-dlp download stderr: %r", dl_result.stderr[:300])
+                files_in_dir = os.listdir(tmpdir)
+                logger.info("Files in tmpdir after download: %s", files_in_dir)
+                for fname in files_in_dir:
                     if fname.endswith(".mp3"):
                         fpath = os.path.join(tmpdir, fname)
                         with open(fpath, "rb") as f:
                             audio_bytes = f.read()
                         os.remove(fpath)
                         return audio_bytes, title, uploader, duration
+                if dl_result.stderr:
+                    last_error = dl_result.stderr.strip()[-300:]
             except Exception as e:
-                last_error = str(e)[:200]
+                last_error = str(e)[:300]
+                logger.error("yt-dlp download exception: %s", last_error)
                 for fn in os.listdir(tmpdir):
                     try:
                         os.remove(os.path.join(tmpdir, fn))
