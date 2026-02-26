@@ -939,10 +939,13 @@ async def download_music_by_query(query: str):
         for url, title, uploader, duration in entries_to_try[:5]:
             try:
                 out_template = os.path.join(tmpdir, "track.%(ext)s")
+                cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+                cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
                 dl_result = _sp.run(
                     ["yt-dlp", "-f", "bestaudio/best",
                      "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
                      "--no-playlist", "--no-warnings", "--max-filesize", "48m",
+                     *cookies_args,
                      "-o", out_template, url],
                     capture_output=True, text=True, timeout=120
                 )
