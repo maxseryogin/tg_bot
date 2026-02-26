@@ -877,6 +877,12 @@ async def download_music_by_query(query: str):
 
     tmpdir = tempfile.mkdtemp(prefix="juza_music_")
     outtmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
+
+    YTDLP_HEADERS = {
+        "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     base_opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": outtmpl,
@@ -884,40 +890,79 @@ async def download_music_by_query(query: str):
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
-        "extractor_args": {"youtube": {"player_client": ["ios", "android", "tv_embedded"]}},
-        "http_headers": {
-            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "extractor_args": {"youtube": {"player_client": ["ios", "android"]}},
+        "http_headers": YTDLP_HEADERS,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
         "max_filesize": 48 * 1024 * 1024,
         "socket_timeout": 30,
-        "retries": 5,
+        "retries": 3,
     }
     loop = asyncio.get_event_loop()
 
+    def _search_via_piped(q: str):
+        """Ищет видео через Piped API (не требует токенов YouTube)."""
+        import urllib.request, json as _json, urllib.parse
+        instances = [
+            "https://pipedapi.kavin.rocks",
+            "https://piped-api.garudalinux.org",
+            "https://api.piped.projectsegfau.lt",
+        ]
+        for base in instances:
+            try:
+                url = f"{base}/search?q={urllib.parse.quote(q)}&filter=music_songs"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = _json.loads(r.read())
+                items = data.get("items") or []
+                ids = []
+                for item in items[:5]:
+                    vid_url = item.get("url", "")
+                    if "watch?v=" in vid_url:
+                        vid_id = vid_url.split("watch?v=")[-1].split("&")[0]
+                        if vid_id:
+                            ids.append((vid_id, item.get("title", q), item.get("uploaderName", ""), item.get("duration", 0)))
+                if ids:
+                    return ids
+            except Exception:
+                continue
+        return []
+
     def _download():
         last_error = ""
-        try:
-            with YoutubeDL({**base_opts, "default_search": "ytsearch5", "ignoreerrors": True}) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if not info:
-                    return None, "yt-dlp не вернул инфо", None, None
-                entries = info.get("entries") or []
-                if not isinstance(entries, list):
-                    entries = [entries] if entries else []
-                entries = [e for e in entries if e and e.get("id")]
-            if not entries:
-                return None, "ничего не найдено", None, None
-        except Exception as e:
-            last_error = str(e)[:200]
-            entries = []
 
-        for entry in entries[:5]:
-            vid_id = entry.get("id") or ""
-            url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else entry.get("url", "")
-            if not url:
-                continue
+        # Шаг 1: ищем через Piped (обходит YouTube ботозащиту)
+        entries_to_try = []
+        piped_results = _search_via_piped(query)
+        if piped_results:
+            entries_to_try = [(f"https://www.youtube.com/watch?v={vid_id}", title, uploader, duration)
+                              for vid_id, title, uploader, duration in piped_results]
+
+        # Шаг 2: если Piped не помог — пробуем через yt-dlp ytsearch
+        if not entries_to_try:
+            try:
+                with YoutubeDL({**base_opts, "default_search": "ytsearch5", "ignoreerrors": True}) as ydl:
+                    info = ydl.extract_info(query, download=False)
+                    if info:
+                        raw_entries = info.get("entries") or []
+                        if not isinstance(raw_entries, list):
+                            raw_entries = [raw_entries] if raw_entries else []
+                        for e in raw_entries:
+                            if e and e.get("id"):
+                                vid_id = e["id"]
+                                entries_to_try.append((
+                                    f"https://www.youtube.com/watch?v={vid_id}",
+                                    e.get("title", query),
+                                    e.get("uploader", "") or e.get("channel", ""),
+                                    e.get("duration", 0),
+                                ))
+            except Exception as e:
+                last_error = str(e)[:200]
+
+        if not entries_to_try:
+            return None, last_error or "ничего не найдено", None, None
+
+        # Шаг 3: скачиваем первый успешный
+        for url, title, uploader, duration in entries_to_try[:5]:
             try:
                 with YoutubeDL({**base_opts, "noplaylist": True}) as ydl:
                     ydl.download([url])
@@ -927,9 +972,7 @@ async def download_music_by_query(query: str):
                         with open(fpath, "rb") as f:
                             audio_bytes = f.read()
                         os.remove(fpath)
-                        return (audio_bytes, entry.get("title", query),
-                                entry.get("uploader", "") or entry.get("channel", ""),
-                                entry.get("duration", 0))
+                        return audio_bytes, title, uploader, duration
             except Exception as e:
                 last_error = str(e)[:200]
                 for fn in os.listdir(tmpdir):
@@ -937,6 +980,7 @@ async def download_music_by_query(query: str):
                         os.remove(os.path.join(tmpdir, fn))
                     except OSError:
                         pass
+
         return None, last_error or "не удалось скачать", None, None
 
     try:
