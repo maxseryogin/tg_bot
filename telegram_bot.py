@@ -1745,9 +1745,21 @@ async def run_bot(backend=None):
             status_msg = await message.reply(f"🎵 Ищу и качаю «{query}»...")
             try:
                 from aiogram.types import BufferedInputFile
+                import shutil
+                # Проверяем наличие ffmpeg
+                ffmpeg_path = shutil.which("ffmpeg")
+                ffmpeg_status = f"ffmpeg={'✓ '+ffmpeg_path if ffmpeg_path else '✗ не найден'}"
+                logger.info("Music download start: query=%r %s", query, ffmpeg_status)
+
                 audio_bytes, title, artist, duration = await download_music_by_query(query)
+                logger.info("Music download result: bytes=%s title=%r error=%r",
+                            len(audio_bytes) if audio_bytes else 0, title, None if audio_bytes else title)
+
                 if not audio_bytes:
-                    await status_msg.edit_text(f"😔 Не смогла найти/скачать «{query}»\n<i>{title}</i>", parse_mode="HTML")
+                    await status_msg.edit_text(
+                        f"😔 Не смогла найти/скачать «{query}»\n<i>{title}</i>\n<code>{ffmpeg_status}</code>",
+                        parse_mode="HTML"
+                    )
                     return
                 audio_file = BufferedInputFile(audio_bytes, filename=f"{title or query}.mp3")
                 await message.reply_audio(
@@ -1763,9 +1775,9 @@ async def run_bot(backend=None):
             except Exception as e:
                 logger.exception("Ошибка скачивания музыки: %s", e)
                 try:
-                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
                 except Exception:
-                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+                    await message.reply(f"❌ Ошибка: {str(e)[:200]}")
             return
 
         # ── «Жужа нарисуй» ────────────────────────────────────────────────────
