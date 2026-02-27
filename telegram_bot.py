@@ -1630,6 +1630,7 @@ async def _ad_cache_refresh():
     session_path = os.path.join(_REP_CACHE_DIR, "session")
     if not os.path.isfile(session_path + ".session"):
         return
+    os.makedirs(_AD_CACHE_DIR, exist_ok=True)
     client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
     try:
         await client.connect()
