@@ -821,15 +821,10 @@ async def generate_image_huggingface(prompt: str) -> tuple:
 
 async def _ytdlp_download_audio(url: str, title: str, uploader: str, duration: int,
                                 cookies_args: list) -> tuple:
-    """
-    Скачивает аудио через yt-dlp с ffmpeg-конвертацией.
-    Возвращает (audio_bytes, title, uploader, duration) или (None, error, None, None).
-    """
     import subprocess as _sp
     tmpdir = tempfile.mkdtemp(prefix="juza_ytdl_")
     try:
         out_template = os.path.join(tmpdir, "track.%(ext)s")
-        # Скачиваем поток целиком без --extract-audio чтобы избежать "format not available"
         cmd = [
             "yt-dlp",
             "--no-playlist", "--no-warnings",
@@ -907,16 +902,18 @@ async def _cobalt_download(query: str) -> tuple:
     if not entries:
         return None, "ничего не найдено", None, None
 
-    # Шаг 2: отдаём первые 3 в cobalt.tools
+    # ── FIX: обновлённый список инстанций cobalt ──────────────────────────────
     COBALT_INSTANCES = [
-        "https://cobalt.tools",
         "https://api.cobalt.tools",
-        "https://co.wuk.sh",
+        "https://cobalt.imput.net",
+        "https://cbl.henhen1227.com",
+        "https://cobalt.tools",
     ]
+    # ── FIX: правильные заголовки для cobalt API v10+ ─────────────────────────
     headers = {
         "Accept":       "application/json",
         "Content-Type": "application/json",
-        "User-Agent":   "Mozilla/5.0",
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
     for entry in entries[:3]:
@@ -949,7 +946,6 @@ async def _cobalt_download(query: str) -> tuple:
                         elif status == "tunnel":
                             dl_url = data.get("url")
                         elif status == "picker":
-                            # Берём первый аудио
                             for item in data.get("picker", []):
                                 if item.get("type") == "audio":
                                     dl_url = item.get("url")
@@ -959,7 +955,6 @@ async def _cobalt_download(query: str) -> tuple:
                             logger.info("cobalt: нет URL в ответе: %s", str(data)[:100])
                             continue
 
-                        # Скачиваем файл
                         async with session.get(
                             dl_url, headers={"User-Agent": "Mozilla/5.0"},
                             timeout=aiohttp.ClientTimeout(total=60),
@@ -970,7 +965,6 @@ async def _cobalt_download(query: str) -> tuple:
                                 continue
                             audio_bytes = await dl_resp.read()
                             if len(audio_bytes) > 5000:
-                                # Конвертируем в mp3 если нужно
                                 ct = dl_resp.headers.get("Content-Type", "")
                                 if "mpeg" not in ct and "mp3" not in ct:
                                     import subprocess as _sp2
@@ -1001,9 +995,6 @@ async def _cobalt_download(query: str) -> tuple:
 
 
 async def _soundcloud_download(query: str) -> tuple:
-    """
-    Скачивает через SoundCloud — работает с серверов без ограничений.
-    """
     import subprocess as _sp
     tmpdir = tempfile.mkdtemp(prefix="juza_sc_")
     try:
@@ -1011,7 +1002,6 @@ async def _soundcloud_download(query: str) -> tuple:
         sc_query = f"scsearch3:{query}"
         logger.info("SoundCloud: поиск '%s'", query)
 
-        # Сначала находим треки
         search = _sp.run(
             ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
              "--no-warnings", sc_query],
@@ -1031,7 +1021,6 @@ async def _soundcloud_download(query: str) -> tuple:
         logger.info("SoundCloud: найдено %d треков", len(entries))
 
         for entry in entries[:3]:
-            # URL для SoundCloud выглядит как полный URL в id
             sc_url = entry["id"] if entry["id"].startswith("http") else f"scsearch1:{query}"
             result = _sp.run(
                 [
@@ -1065,14 +1054,12 @@ async def _soundcloud_download(query: str) -> tuple:
                         data = open(dst, "rb").read()
                         logger.info("✓ SC+ffmpeg: %dKB", len(data) // 1024)
                         return data, entry["title"], entry["uploader"], entry["duration"]
-            # Чистим для следующей попытки
             for fn in os.listdir(tmpdir):
                 try:
                     os.remove(os.path.join(tmpdir, fn))
                 except OSError:
                     pass
 
-        # Фолбэк: прямой поиск через scsearch
         result = _sp.run(
             [
                 "yt-dlp",
@@ -1100,11 +1087,6 @@ async def _soundcloud_download(query: str) -> tuple:
 
 
 async def download_music_by_query(query: str):
-    """
-    Скачивает аудио по запросу.
-    Порядок: cobalt.tools → SoundCloud → yt-dlp (YouTube с cookies).
-    YouTube напрямую через yt-dlp блокируется серверными IP — используется как последний шанс.
-    """
     import subprocess as _sp
 
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
@@ -1112,21 +1094,18 @@ async def download_music_by_query(query: str):
     if cookies_args:
         logger.info("Используем cookies.txt")
 
-    # ── Источник 1: cobalt.tools (работает с серверных IP) ───────────────────
     logger.info("Music [1/3]: cobalt.tools → '%s'", query)
     result = await _cobalt_download(query)
     if result[0]:
         return result
     logger.warning("cobalt.tools не сработал: %s", result[1])
 
-    # ── Источник 2: SoundCloud (не блокирует серверные IP) ───────────────────
     logger.info("Music [2/3]: SoundCloud → '%s'", query)
     result = await _soundcloud_download(query)
     if result[0]:
         return result
     logger.warning("SoundCloud не сработал: %s", result[1])
 
-    # ── Источник 3: YouTube через yt-dlp + cookies (последний шанс) ──────────
     logger.info("Music [3/3]: YouTube yt-dlp → '%s'", query)
     loop = asyncio.get_event_loop()
 
@@ -1272,15 +1251,18 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
     """
     import aiohttp, subprocess as _sp
 
+    # ── FIX: обновлённый список инстанций ────────────────────────────────────
     COBALT_INSTANCES = [
-        "https://cobalt.tools",
         "https://api.cobalt.tools",
-        "https://co.wuk.sh",
+        "https://cobalt.imput.net",
+        "https://cbl.henhen1227.com",
+        "https://cobalt.tools",
     ]
+    # ── FIX: правильные заголовки для cobalt API v10+ ────────────────────────
     headers = {
         "Accept":       "application/json",
         "Content-Type": "application/json",
-        "User-Agent":   "Mozilla/5.0",
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
     for instance in COBALT_INSTANCES:
@@ -1328,7 +1310,6 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
                         video_bytes = await dl_resp.read()
                         if len(video_bytes) > 10_000:
                             ct = dl_resp.headers.get("Content-Type", "")
-                            # Если не mp4 — перекодируем
                             if "mp4" not in ct:
                                 tmpdir = tempfile.mkdtemp(prefix="juza_cob_v_")
                                 try:
@@ -1403,7 +1384,7 @@ async def fetch_meme_melstroy() -> tuple:
             return video_bytes, title
         logger.info("cobalt video не сработал для %s: %s", vid_id, err)
 
-        # ── Источник 2: yt-dlp без -f (пусть сам выберет что доступно) ────────
+        # ── Источник 2: yt-dlp — FIX: явный выбор формата без merge ──────────
         with tempfile.TemporaryDirectory() as tmpdir:
             out_template = os.path.join(tmpdir, "meme.%(ext)s")
             try:
@@ -1414,11 +1395,15 @@ async def fetch_meme_melstroy() -> tuple:
                         "--max-filesize", "49m",
                         "--socket-timeout", "30",
                         "--retries", "2",
+                        # FIX: выбираем формат без слияния потоков
+                        # "Requested format is not available" = нет нужного merged формата
+                        # best[ext=mp4] = один файл mp4, не требует ffmpeg merge
+                        "-f", "best[ext=mp4][filesize<49M]/best[ext=webm][filesize<49M]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
                         *cookies_args,
                         "-o", out_template,
                         yt_url,
                     ],
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True, timeout=180,
                 )
                 if result_dl.stderr:
                     logger.info("yt-dlp meme stderr: %r", result_dl.stderr[:100])
@@ -1880,7 +1865,6 @@ async def run_bot(backend=None):
 
         user_id = message.from_user.id if message.from_user else 0
 
-        # Реакция на сообщение от владельца (10%)
         if user_id == ALLOWED_USER_ID and random.random() < 0.10:
             try:
                 await bot.set_message_reaction(
@@ -1890,7 +1874,6 @@ async def run_bot(backend=None):
             except Exception:
                 pass
 
-        # Случайная реакция (5%)
         if random.random() < 0.05:
             try:
                 emoji = random.choice(("❤", "🔥", "👍", "😂", "😢", "🤔", "👀", "💯", "🎉", "❤️‍🔥"))
@@ -1903,7 +1886,6 @@ async def run_bot(backend=None):
 
         text = (message.text or "").strip().lower()
 
-        # ── жужа шо можешь ────────────────────────────────────────────────────
         if HELP_TRIGGER.lower() in text:
             now  = time.time()
             last = _help_cooldowns.get(user_id, 0)
@@ -1914,7 +1896,6 @@ async def run_bot(backend=None):
             await message.reply(HELP_TEXT, parse_mode="HTML")
             return
 
-        # ── жужа цитату ───────────────────────────────────────────────────────
         if QUOTE_TRIGGER.lower() in text:
             now  = time.time()
             last = _quote_cooldowns.get(user_id, 0)
@@ -1931,7 +1912,6 @@ async def run_bot(backend=None):
                 safe_quote = safe_quote[:4000] + "..."
             await message.reply(f"<blockquote>{safe_quote}</blockquote>", parse_mode="HTML")
 
-        # ── жужа го реповать ─────────────────────────────────────────────────
         if REP_TRIGGER.lower() in text:
             now  = time.time()
             last = _rep_cooldowns.get(user_id, 0)
@@ -1986,7 +1966,6 @@ async def run_bot(backend=None):
                     except OSError:
                         pass
 
-        # ── жужа рекламу ──────────────────────────────────────────────────────
         if AD_TRIGGER.lower() in text:
             now  = time.time()
             last = _ad_cooldowns.get(user_id, 0)
@@ -2056,7 +2035,6 @@ async def run_bot(backend=None):
                     except OSError:
                         pass
 
-        # ── жужа мем мелстрой ─────────────────────────────────────────────────
         if MEME_TRIGGER.lower() in text:
             now  = time.time()
             last = _meme_cooldowns.get(user_id, 0)
@@ -2090,7 +2068,6 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:100]}")
             return
 
-        # ── жужа музло ────────────────────────────────────────────────────────
         if MUSIC_TRIGGER.lower() in text:
             now  = time.time()
             last = _music_cooldowns.get(user_id, 0)
@@ -2151,7 +2128,6 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:200]}")
             return
 
-        # ── жужа нарисуй ──────────────────────────────────────────────────────
         if DRAW_TRIGGER.lower() in text:
             chat_id = message.chat.id
             now     = time.time()
@@ -2197,7 +2173,6 @@ async def run_bot(backend=None):
                 image_bytes = None
                 error_str   = "все сервисы недоступны"
 
-                # Приоритет 0: g4f FLUX (бесплатно, без токенов)
                 logger.info("Draw: пробуем g4f FLUX...")
                 image_bytes, error_str = await generate_image_g4f(prompt_en)
                 if image_bytes:
@@ -2205,7 +2180,6 @@ async def run_bot(backend=None):
                 else:
                     logger.warning("Draw: g4f: %s", error_str)
 
-                # Приоритет 1: Gemini
                 if not image_bytes and GEMINI_API_KEY:
                     logger.info("Draw: пробуем Gemini...")
                     image_bytes, error_str = await generate_image_gemini(prompt_en)
@@ -2214,7 +2188,6 @@ async def run_bot(backend=None):
                     else:
                         logger.warning("Draw: Gemini: %s", error_str)
 
-                # Приоритет 2: Together AI
                 if not image_bytes and TOGETHER_API_TOKEN:
                     logger.info("Draw: пробуем Together AI...")
                     image_bytes, error_str = await generate_image_together(prompt_en)
@@ -2223,7 +2196,6 @@ async def run_bot(backend=None):
                     else:
                         logger.warning("Draw: Together AI: %s", error_str)
 
-                # Приоритет 3: Replicate
                 if not image_bytes and REPLICATE_API_TOKEN:
                     logger.info("Draw: пробуем Replicate...")
                     image_bytes, error_str = await generate_image_replicate(prompt_en)
@@ -2232,7 +2204,6 @@ async def run_bot(backend=None):
                     else:
                         logger.warning("Draw: Replicate: %s", error_str)
 
-                # Приоритет 4: Pollinations (бесплатно)
                 if not image_bytes:
                     logger.info("Draw: пробуем Pollinations...")
                     image_bytes, error_str = await generate_image_pollinations(prompt_en)
@@ -2263,7 +2234,6 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:100]}")
             return
 
-        # ── жужа найди ────────────────────────────────────────────────────────
         if SEARCH_TRIGGER.lower() in text:
             now  = time.time()
             last = _search_cooldowns.get(user_id, 0)
@@ -2314,13 +2284,11 @@ async def run_bot(backend=None):
         uname    = (user_obj.username or "") if user_obj else ""
         chat_id  = message.chat.id
 
-        # ── Триггер «сгк» ─────────────────────────────────────────────────────
         if _trigger_matches(text) and user_id == ALLOWED_USER_ID:
             be = get_backend()
             await cmd_trigger(message, bot, be)
             return
 
-        # ── Болталка: включение / выключение ──────────────────────────────────
         if CHAT_ON_TRIGGER.lower() in text:
             if _is_admin(user_id, uname):
                 if not _chat_mode_enabled.get(chat_id):
@@ -2339,14 +2307,12 @@ async def run_bot(backend=None):
                 await message.reply("молчу 🤐")
             return
 
-        # ── Тест-триггер ──────────────────────────────────────────────────────
         if CHAT_TEST_TRIGGER.lower() in text and _chat_mode_enabled.get(chat_id):
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
             reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
             await message.reply(reply_text if reply_text else "тут, но что-то пошло не так 😔")
             return
 
-        # ── Болталка: упоминание «жужа» ───────────────────────────────────────
         if "жужа" in text and _chat_mode_enabled.get(chat_id):
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
             reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
@@ -2354,7 +2320,6 @@ async def run_bot(backend=None):
                 await message.reply(reply_text)
             return
 
-        # ── Болталка: 10% спонтанный ответ ────────────────────────────────────
         if _chat_mode_enabled.get(chat_id) and random.random() < 0.10:
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
             reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
