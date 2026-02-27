@@ -1094,33 +1094,39 @@ async def download_music_by_query(query: str):
     import glob
     import shutil as _sh
 
+    # Путь к кукам
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
+    
     if cookies_args:
         logger.info("Используем cookies.txt")
 
+    # [1/3] Попытка через Cobalt
     logger.info("Music [1/3]: cobalt.tools → '%s'", query)
     result = await _cobalt_download(query)
     if result[0]:
         return result
     logger.warning("cobalt.tools не сработал: %s", result[1])
 
+    # [2/3] Попытка через SoundCloud
     logger.info("Music [2/3]: SoundCloud → '%s'", query)
     result = await _soundcloud_download(query)
     if result[0]:
         return result
     logger.warning("SoundCloud не сработал: %s", result[1])
 
+    # [3/3] Попытка через YouTube (yt-dlp)
     logger.info("Music [3/3]: YouTube yt-dlp → '%s'", query)
     loop = asyncio.get_event_loop()
 
     def _yt_search_and_download():
         try:
+            # Поиск первых 3 подходящих видео
             search = _sp.run(
                 ["yt-dlp", "--flat-playlist",
                  "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
                  "--no-warnings", "--default-search", "ytsearch3", query],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=25,
             )
             entries = []
             for line in search.stdout.splitlines():
@@ -1133,56 +1139,63 @@ async def download_music_by_query(query: str):
                         "duration": int(parts[3]) if len(parts) > 3 and parts[3].strip().isdigit() else 0,
                     })
         except Exception as e:
-            return None, str(e)[:100], None, None
+            return None, f"YouTube поиск упал: {str(e)[:100]}", None, None
 
         if not entries:
             return None, "YouTube: ничего не найдено", None, None
 
         last_error = "не удалось скачать"
+        
+        # Перебираем результаты поиска (макс 3)
         for entry in entries[:3]:
-            tmpdir2 = tempfile.mkdtemp(prefix="juza_yt_")
+            tmpdir = tempfile.mkdtemp(prefix="juza_yt_")
             try:
-                AUDIO_FORMATS = ["140", "251", "18"]
-                out_path = os.path.join(tmpdir2, "track.%(ext)s")
+                out_path_t = os.path.join(tmpdir, "track.%(ext)s")
+                
+                # Используем -f "ba/b" — yt-dlp сам выберет лучший доступный аудио-поток
                 r = _sp.run(
                     ["yt-dlp", "--no-playlist", "--no-warnings",
-                    "--max-filesize", "48m", "--socket-timeout", "30", "--retries", "3",
-                    "-f", "ba/b", *cookies_args, "-o", out_path, entry["url"]],
-                    capture_output=True, text=True, timeout=120,
+                     "--max-filesize", "50m", "--socket-timeout", "30", "--retries", "3",
+                     "-f", "ba/b", *cookies_args, "-o", out_path_t, entry["url"]],
+                    capture_output=True, text=True, timeout=180,
                 )
 
                 if r.returncode != 0:
-                    last_error = r.stderr.strip()[-150:] if r.stderr else "Ошибка yt-dlp"
-                    continue # Переходим к следующему результату поиска
-
-                # Ищем скачанный файл (он может быть .webm, .m4a и т.д.)
-                import glob
-                files = glob.glob(os.path.join(tmpdir2, "track.*"))
-                if not files:
-                    last_error = "Файл не был скачан"
+                    last_error = r.stderr.strip()[-150:] if r.stderr else "ошибка yt-dlp"
                     continue
 
-                fpath = files[0]
-                dst = os.path.join(tmpdir2, "out.mp3")
+                # Ищем скачанный файл (расширение может быть любым: .webm, .m4a, .opus)
+                downloaded_files = glob.glob(os.path.join(tmpdir, "track.*"))
+                if not downloaded_files:
+                    last_error = "файл не найден после загрузки"
+                    continue
 
-                # Конвертируем в mp3
+                fpath = downloaded_files[0]
+                dst_mp3 = os.path.join(tmpdir, "final.mp3")
+
+                # Конвертируем в MP3 (чтобы Telegram точно съел)
                 conv = _sp.run(
-                    ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
-                    capture_output=True, timeout=60
+                    ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", 
+                     "-ac", "2", "-b:a", "128k", dst_mp3],
+                    capture_output=True, timeout=90
                 )
 
-                if os.path.isfile(dst):
-                    data = open(dst, "rb").read()
+                if os.path.isfile(dst_mp3):
+                    with open(dst_mp3, "rb") as f:
+                        data = f.read()
+                    logger.info("✓ YT+ffmpeg успех: %d KB", len(data) // 1024)
                     return data, entry["title"], entry["uploader"], entry["duration"]
+                else:
+                    last_error = conv.stderr.decode(errors='ignore')[-150:] if conv.stderr else "ffmpeg не создал mp3"
+
             except Exception as e:
                 last_error = str(e)[:150]
             finally:
-                _sh.rmtree(tmpdir2, ignore_errors=True)
+                _sh.rmtree(tmpdir, ignore_errors=True)
 
         return None, f"YouTube: {last_error}", None, None
 
     return await loop.run_in_executor(None, _yt_search_and_download)
-
 # ── Поиск изображений (DuckDuckGo) ────────────────────────────────────────────
 
 async def search_image(query: str):
@@ -1393,10 +1406,11 @@ async def fetch_meme_melstroy() -> tuple:
                     r = subprocess.run(
                         ["yt-dlp", "-f", "b[height<=480]/bv*[height<=480]+ba/b",
                         "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
-                        "-o", out_template, f"https://www.youtube.com/watch?v={vid_id}"],
+                        "-o", out_path, f"https://www.youtube.com/watch?v={vid_id}"],
                         capture_output=True, text=True, timeout=120
                     )
-                                        stderr = r.stderr or ""
+                    if r.returncode != 0:
+                        stderr = r.stderr or ""
                     if "not available" in stderr or "Requested format" in stderr:
                         logger.info("fmt=%r недоступен для %s", fmt, vid_id)
                         continue
