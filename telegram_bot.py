@@ -881,54 +881,119 @@ async def download_music_by_query(query: str):
         if cookies_args:
             logger.info("Используем cookies.txt: %s", cookies_path)
 
+        # Разные наборы аргументов — пробуем по очереди если один не сработал.
+        # "Requested format is not available" = YouTube заблокировал конкретный формат для серверного IP.
+        # Решение: пробовать разные player_client и не указывать -f жёстко.
+        DOWNLOAD_STRATEGIES = [
+            # Стратегия 1: tv_embedded — обычно не блокируется, даёт форматы без ограничений
+            [
+                "--extractor-args", "youtube:player_client=tv_embedded",
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+            ],
+            # Стратегия 2: web_creator — ещё один незаблокированный клиент
+            [
+                "--extractor-args", "youtube:player_client=web_creator,tv_embedded",
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+            ],
+            # Стратегия 3: mweb (мобильный веб) — часто проходит там где desktop нет
+            [
+                "--extractor-args", "youtube:player_client=mweb,web",
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+            ],
+            # Стратегия 4: явно указываем форматы которые обычно есть у всех видео
+            [
+                "--extractor-args", "youtube:player_client=tv_embedded,web",
+                "-f", "140/251/250/249/171/worstaudio",
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+            ],
+            # Стратегия 5: compat-режим + format-sort без жёсткого -f
+            [
+                "--extractor-args", "youtube:player_client=web,android,tv_embedded,mweb",
+                "--extract-audio", "--audio-format", "mp3",
+                "--format-sort", "aext:m4a,abr",
+            ],
+            # Стратегия 6: последний шанс — скачать видео и вырезать аудио ffmpeg
+            [
+                "--extractor-args", "youtube:player_client=tv_embedded",
+                "-f", "worst[ext=mp4]/worst",
+                "--recode-video", "mp4",
+            ],
+        ]
+
         # Шаг 2: Скачиваем первый доступный трек
         for url, title, uploader, duration in entries_to_try[:5]:
-            try:
-                out_template = os.path.join(tmpdir, "track.%(ext)s")
-                dl_result = _sp.run(
-                    [
+            for strategy_idx, strategy_args in enumerate(DOWNLOAD_STRATEGIES):
+                try:
+                    # Чистим tmpdir перед каждой попыткой
+                    for fn in os.listdir(tmpdir):
+                        try:
+                            os.remove(os.path.join(tmpdir, fn))
+                        except OSError:
+                            pass
+
+                    out_template = os.path.join(tmpdir, "track.%(ext)s")
+                    cmd = [
                         "yt-dlp",
-                        "-f", "bestaudio/best",
-                        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+                        *strategy_args,
                         "--no-playlist", "--no-warnings",
                         "--max-filesize", "48m",
                         "--socket-timeout", "30",
-                        "--retries", "3",
-                        # iOS user-agent — снижает вероятность блокировки
-                        "--add-header",
-                        "User-Agent:com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-                        "--extractor-args", "youtube:player_client=ios,android",
+                        "--retries", "2",
                         *cookies_args,
                         "-o", out_template,
                         url,
-                    ],
-                    capture_output=True, text=True, timeout=180,
-                )
-                if dl_result.stderr:
-                    logger.info("yt-dlp download stderr: %r", dl_result.stderr[:300])
+                    ]
+                    logger.info("Стратегия %d: %s", strategy_idx + 1, url[:60])
+                    dl_result = _sp.run(cmd, capture_output=True, text=True, timeout=180)
 
-                files_in_dir = os.listdir(tmpdir)
-                logger.info("Files in tmpdir: %s", files_in_dir)
+                    if dl_result.stderr:
+                        logger.info("stderr стратегии %d: %r", strategy_idx + 1, dl_result.stderr[:200])
 
-                for fname in files_in_dir:
-                    if fname.endswith(".mp3"):
-                        fpath = os.path.join(tmpdir, fname)
-                        with open(fpath, "rb") as f:
-                            audio_bytes = f.read()
-                        os.remove(fpath)
-                        logger.info("Music downloaded: %dKB, title=%s", len(audio_bytes) // 1024, title)
-                        return audio_bytes, title, uploader, duration
+                    files_in_dir = os.listdir(tmpdir)
+                    logger.info("Файлы в tmpdir: %s", files_in_dir)
 
-                if dl_result.stderr:
-                    last_error = dl_result.stderr.strip()[-300:]
-            except Exception as e:
-                last_error = str(e)[:300]
-                logger.error("yt-dlp download exception: %s", last_error)
-                for fn in os.listdir(tmpdir):
-                    try:
-                        os.remove(os.path.join(tmpdir, fn))
-                    except OSError:
-                        pass
+                    # Сначала ищем mp3
+                    for fname in files_in_dir:
+                        if fname.endswith(".mp3"):
+                            fpath = os.path.join(tmpdir, fname)
+                            with open(fpath, "rb") as f:
+                                audio_bytes = f.read()
+                            os.remove(fpath)
+                            logger.info("✓ Скачано mp3: %dKB, title=%s", len(audio_bytes) // 1024, title)
+                            return audio_bytes, title, uploader, duration
+
+                    # Если mp3 нет, ищем любое аудио и конвертируем ffmpeg вручную
+                    audio_exts = (".m4a", ".webm", ".ogg", ".opus", ".aac", ".wav", ".flac", ".mp4")
+                    for fname in files_in_dir:
+                        if any(fname.endswith(ext) for ext in audio_exts):
+                            src_path = os.path.join(tmpdir, fname)
+                            dst_path = os.path.join(tmpdir, "converted.mp3")
+                            logger.info("Конвертируем %s → mp3...", fname)
+                            conv = _sp.run(
+                                ["ffmpeg", "-y", "-i", src_path,
+                                 "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                                 dst_path],
+                                capture_output=True, timeout=120,
+                            )
+                            if conv.returncode == 0 and os.path.isfile(dst_path):
+                                with open(dst_path, "rb") as f:
+                                    audio_bytes = f.read()
+                                logger.info("✓ Конвертировано: %dKB", len(audio_bytes) // 1024)
+                                return audio_bytes, title, uploader, duration
+                            else:
+                                logger.warning("ffmpeg ошибка: %r", conv.stderr[:200] if conv.stderr else "")
+
+                    if dl_result.stderr:
+                        last_error = dl_result.stderr.strip()[-300:]
+                    else:
+                        last_error = f"стратегия {strategy_idx+1}: файл не создан"
+
+                except Exception as e:
+                    last_error = str(e)[:300]
+                    logger.error("Исключение стратегии %d: %s", strategy_idx + 1, last_error)
+
+            # Если все стратегии для этого видео не сработали — пробуем следующее
+            logger.warning("Все стратегии не сработали для %s, пробуем следующее видео", url[:60])
 
         return None, last_error or "не удалось скачать", None, None
 
@@ -1037,35 +1102,82 @@ async def fetch_meme_melstroy() -> tuple:
             continue
         vid_id, title = parts[0].strip(), parts[1].strip()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_template = os.path.join(tmpdir, "meme.%(ext)s")
-            try:
-                subprocess.run(
-                    [
-                        "yt-dlp",
-                        "-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
-                              "/best[height<=480][ext=mp4]/best[height<=480]/best",
-                        "--merge-output-format", "mp4",
-                        "--no-playlist", "--no-warnings",
-                        *cookies_args,
-                        "-o", out_template,
-                        f"https://www.youtube.com/watch?v={vid_id}",
-                    ],
-                    capture_output=True, text=True, timeout=120,
-                )
-            except Exception:
-                continue
+        # Стратегии скачивания видео (те же что для музыки — обходим "format not available")
+        VIDEO_STRATEGIES = [
+            # 1: tv_embedded — не требует подтверждения возраста, обычно даёт форматы
+            [
+                "--extractor-args", "youtube:player_client=tv_embedded",
+                "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+                "--merge-output-format", "mp4",
+            ],
+            # 2: web_creator
+            [
+                "--extractor-args", "youtube:player_client=web_creator,tv_embedded",
+                "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+                "--merge-output-format", "mp4",
+            ],
+            # 3: mweb — мобильный веб
+            [
+                "--extractor-args", "youtube:player_client=mweb,web",
+                "-f", "best[height<=480]/best",
+                "--merge-output-format", "mp4",
+            ],
+            # 4: без -f, format-sort — yt-dlp сам выберет доступный
+            [
+                "--extractor-args", "youtube:player_client=tv_embedded,web",
+                "--format-sort", "res:480,ext:mp4",
+                "--merge-output-format", "mp4",
+            ],
+            # 5: полный фолбэк — берём что угодно
+            [
+                "--extractor-args", "youtube:player_client=web,tv_embedded",
+                "--merge-output-format", "mp4",
+            ],
+        ]
 
-            files = glob.glob(os.path.join(tmpdir, "meme.*"))
-            if not files:
-                continue
-            try:
-                with open(files[0], "rb") as f:
-                    video_bytes = f.read()
-                if 10_000 < len(video_bytes) <= 49 * 1024 * 1024:
-                    return video_bytes, title
-            except Exception:
-                continue
+        downloaded = False
+        for strategy_idx, strategy_args in enumerate(VIDEO_STRATEGIES):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_template = os.path.join(tmpdir, "meme.%(ext)s")
+                try:
+                    result_dl = subprocess.run(
+                        [
+                            "yt-dlp",
+                            *strategy_args,
+                            "--no-playlist", "--no-warnings",
+                            "--max-filesize", "49m",
+                            "--socket-timeout", "30",
+                            "--retries", "2",
+                            *cookies_args,
+                            "-o", out_template,
+                            f"https://www.youtube.com/watch?v={vid_id}",
+                        ],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    if result_dl.stderr:
+                        logger.info("Мем стратегия %d stderr: %r", strategy_idx + 1, result_dl.stderr[:150])
+                except Exception as e:
+                    logger.warning("Мем стратегия %d exception: %s", strategy_idx + 1, e)
+                    continue
+
+                files = glob.glob(os.path.join(tmpdir, "meme.*"))
+                if not files:
+                    logger.info("Мем стратегия %d: файлов нет", strategy_idx + 1)
+                    continue
+                try:
+                    with open(files[0], "rb") as f:
+                        video_bytes = f.read()
+                    if 10_000 < len(video_bytes) <= 49 * 1024 * 1024:
+                        logger.info("✓ Мем стратегия %d: %dKB", strategy_idx + 1, len(video_bytes) // 1024)
+                        return video_bytes, title
+                    else:
+                        logger.info("Мем стратегия %d: файл слишком маленький или большой (%d bytes)",
+                                    strategy_idx + 1, len(video_bytes))
+                except Exception as e:
+                    logger.warning("Мем стратегия %d read error: %s", strategy_idx + 1, e)
+                    continue
+
+        logger.warning("Все стратегии не сработали для мема vid_id=%s", vid_id)
 
     return None, "Не удалось скачать ни одно видео"
 
