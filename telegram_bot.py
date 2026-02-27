@@ -1088,6 +1088,11 @@ async def _soundcloud_download(query: str) -> tuple:
 
 async def download_music_by_query(query: str):
     import subprocess as _sp
+    import os
+    import asyncio
+    import tempfile
+    import glob
+    import shutil as _sh
 
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
@@ -1137,45 +1142,52 @@ async def download_music_by_query(query: str):
         for entry in entries[:3]:
             tmpdir2 = tempfile.mkdtemp(prefix="juza_yt_")
             try:
-                out_t = os.path.join(tmpdir2, "track.%(ext)s")
-                r = _sp.run(
-                    ["yt-dlp",
-                     "--no-playlist", "--no-warnings",
-                     "--max-filesize", "48m", "--socket-timeout", "30", "--retries", "3",
-                     *cookies_args, "-o", out_t, entry["url"]],
-                    capture_output=True, text=True, timeout=200,
-                )
-                if r.stderr:
-                    logger.info("YT stderr: %r", r.stderr[:150])
-                files = os.listdir(tmpdir2)
-                audio_exts = (".mp3", ".m4a", ".webm", ".ogg", ".opus", ".aac", ".wav", ".flac", ".mp4")
-                for fname in files:
-                    fpath = os.path.join(tmpdir2, fname)
-                    if fname.endswith(".mp3"):
-                        data = open(fpath, "rb").read()
+                AUDIO_FORMATS = ["140", "251", "18"]
+                for fmt in AUDIO_FORMATS:
+                    out_path = os.path.join(tmpdir2, f"t{fmt}.%(ext)s")
+                    r = _sp.run(
+                        ["yt-dlp", "--no-playlist", "--no-warnings",
+                         "--max-filesize", "48m", "--socket-timeout", "30", "--retries", "2",
+                         "-f", fmt, *cookies_args, "-o", out_path, entry["url"]],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    
+                    if r.stderr:
+                        logger.info("YT stderr (fmt %s): %r", fmt, r.stderr[:150])
+                    
+                    if "not available" in (r.stderr or "") or "Requested format" in (r.stderr or ""):
+                        last_error = r.stderr.strip()[-150:] if r.stderr else f"Формат {fmt} недоступен"
+                        continue
+
+                    files = glob.glob(os.path.join(tmpdir2, f"t{fmt}.*"))
+                    if not files:
+                        last_error = f"Файл для формата {fmt} не создан"
+                        continue
+
+                    fpath = files[0]
+                    dst = os.path.join(tmpdir2, "out.mp3")
+                    
+                    conv = _sp.run(
+                        ["ffmpeg", "-y", "-i", fpath, 
+                         "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
+                        capture_output=True, timeout=60
+                    )
+                    
+                    if os.path.isfile(dst):
+                        data = open(dst, "rb").read()
+                        logger.info("✓ YT+ffmpeg (fmt %s): %dKB", fmt, len(data) // 1024)
                         return data, entry["title"], entry["uploader"], entry["duration"]
-                    if any(fname.endswith(e) for e in audio_exts):
-                        dst = os.path.join(tmpdir2, "out.mp3")
-                        conv = _sp.run(
-                            ["ffmpeg", "-y", "-i", fpath,
-                             "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
-                            capture_output=True, timeout=120,
-                        )
-                        if conv.returncode == 0 and os.path.isfile(dst):
-                            data = open(dst, "rb").read()
-                            logger.info("✓ YT+ffmpeg: %dKB", len(data) // 1024)
-                            return data, entry["title"], entry["uploader"], entry["duration"]
-                last_error = r.stderr.strip()[-150:] if r.stderr else "файл не создан"
+                    else:
+                        last_error = conv.stderr.strip()[-150:] if conv.stderr else "Ошибка конвертации ffmpeg"
+
             except Exception as e:
                 last_error = str(e)[:150]
             finally:
-                import shutil as _sh
                 _sh.rmtree(tmpdir2, ignore_errors=True)
 
         return None, f"YouTube: {last_error}", None, None
 
     return await loop.run_in_executor(None, _yt_search_and_download)
-
 
 # ── Поиск изображений (DuckDuckGo) ────────────────────────────────────────────
 
@@ -1371,54 +1383,44 @@ async def fetch_meme_melstroy() -> tuple:
     logger.info("Плейлист Мелстроя: %d видео", len(lines))
     random.shuffle(lines)
 
-    for entry in lines[:8]:
+    VIDEO_FORMATS = ["18", "22", "17"]
+
+    for entry in lines[:12]:
         parts = entry.split("\t", 1)
         if len(parts) < 2:
             continue
         vid_id, title = parts[0].strip(), parts[1].strip()
         yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-        # ── Источник 1: cobalt.tools ──────────────────────────────────────────
-        video_bytes, err = await _cobalt_download_video(yt_url, title)
-        if video_bytes:
-            return video_bytes, title
-        logger.info("cobalt video не сработал для %s: %s", vid_id, err)
-
-        # ── Источник 2: yt-dlp — FIX: явный выбор формата без merge ──────────
         with tempfile.TemporaryDirectory() as tmpdir:
-            out_template = os.path.join(tmpdir, "meme.%(ext)s")
-            try:
-                result_dl = subprocess.run(
-                    [
-                        "yt-dlp",
-                        "--no-playlist", "--no-warnings",
-                        "--max-filesize", "49m",
-                        "--socket-timeout", "30",
-                        "--retries", "2",
-                        # FIX: выбираем формат без слияния потоков
-                        # "Requested format is not available" = нет нужного merged формата
-                        # best[ext=mp4] = один файл mp4, не требует ffmpeg merge
-                        "-f", "best[ext=mp4][filesize<49M]/best[ext=webm][filesize<49M]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
-                        *cookies_args,
-                        "-o", out_template,
-                        yt_url,
-                    ],
-                    capture_output=True, text=True, timeout=180,
-                )
-                if result_dl.stderr:
-                    logger.info("yt-dlp meme stderr: %r", result_dl.stderr[:100])
+            for fmt in VIDEO_FORMATS:
+                out_path = os.path.join(tmpdir, f"v{fmt}.%(ext)s")
+                try:
+                    r = subprocess.run(
+                        ["yt-dlp", "--no-playlist", "--no-warnings",
+                        "--max-filesize", "49m", "--socket-timeout", "30", "--retries", "2",
+                        "-f", fmt, *cookies_args, "-o", out_path, yt_url],
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    stderr = r.stderr or ""
+                    if "not available" in stderr or "Requested format" in stderr:
+                        logger.info("fmt=%r недоступен для %s", fmt, vid_id)
+                        continue
+                    import glob
+                    files = glob.glob(os.path.join(tmpdir, f"v{fmt}.*"))
+                    if files:
+                        fpath = files[0]
+                        size = os.path.getsize(fpath)
+                        if 10_000 < size <= 49 * 1024 * 1024:
+                            video_bytes = open(fpath, "rb").read()
+                            logger.info("✓ мем fmt=%r: %dKB '%s'", fmt, len(video_bytes)//1024, title[:30])
+                            return video_bytes, title
+                except subprocess.TimeoutExpired:
+                    continue
+                except Exception as e:
+                    logger.info("fmt=%r exception: %s", fmt, str(e)[:60])
 
-                import glob
-                files = glob.glob(os.path.join(tmpdir, "meme.*"))
-                if files:
-                    video_bytes = open(files[0], "rb").read()
-                    if 10_000 < len(video_bytes) <= 49 * 1024 * 1024:
-                        logger.info("✓ yt-dlp meme: %dKB", len(video_bytes) // 1024)
-                        return video_bytes, title
-            except Exception as e:
-                logger.info("yt-dlp meme exception: %s", str(e)[:60])
-
-    return None, "Не удалось скачать ни одно видео"
+    return None, "Не удалось скачать (YouTube блокирует серверный IP)"
 
 
 # ── Цитата ────────────────────────────────────────────────────────────────────
