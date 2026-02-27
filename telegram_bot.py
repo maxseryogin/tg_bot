@@ -70,13 +70,15 @@ def _config(key: str, default: str = "") -> str:
         pass
     return default
 
-BOT_TOKEN = _config("TELEGRAM_BOT_TOKEN")
-_allowed = _config("ALLOWED_USER_ID", "0")
-ALLOWED_USER_ID = int(_allowed) if _allowed.isdigit() else 0
-HUGGINGFACE_TOKEN = _config("HUGGINGFACE_TOKEN", "")
-PLAYER_URL = _config("PLAYER_URL", "http://localhost:9988")
-TOGETHER_API_TOKEN = _config("TOGETHER_API_TOKEN", "")
-GEMINI_API_KEY = _config("GEMINI_API_KEY", "")
+BOT_TOKEN           = _config("TELEGRAM_BOT_TOKEN")
+_allowed            = _config("ALLOWED_USER_ID", "0")
+ALLOWED_USER_ID     = int(_allowed) if _allowed.isdigit() else 0
+HUGGINGFACE_TOKEN   = _config("HUGGINGFACE_TOKEN", "")
+PLAYER_URL          = _config("PLAYER_URL", "http://localhost:9988")
+TOGETHER_API_TOKEN  = _config("TOGETHER_API_TOKEN", "")
+GEMINI_API_KEY      = _config("GEMINI_API_KEY", "")
+REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
+TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,9 +88,14 @@ logging.basicConfig(
 logger = logging.getLogger("telegram_bot")
 
 TRIGGER_MENTION = "orqis"
-TRIGGER_WORD = "сгк"
-TRIGGER_PATTERN = re.compile(r"@?\s*" + re.escape(TRIGGER_MENTION) + r"\s+.*?" + re.escape(TRIGGER_WORD), re.IGNORECASE | re.DOTALL)
+TRIGGER_WORD    = "сгк"
+TRIGGER_PATTERN = re.compile(
+    r"@?\s*" + re.escape(TRIGGER_MENTION) + r"\s+.*?" + re.escape(TRIGGER_WORD),
+    re.IGNORECASE | re.DOTALL,
+)
 
+
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def _get_backend():
     return None
@@ -164,8 +171,8 @@ def _html_quote(text: str) -> str:
         return ""
     escaped = (
         text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
     )
     return f"<blockquote>{escaped}</blockquote>"
 
@@ -195,6 +202,8 @@ def _decode_cover_to_bytes(cover_data: str):
         return None, None
 
 
+# ── Команда «сгк» ─────────────────────────────────────────────────────────────
+
 async def cmd_trigger(message, bot, backend):
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
@@ -213,18 +222,18 @@ async def cmd_trigger(message, bot, backend):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📝 Получить текст", callback_data="get_lyrics"),
-            InlineKeyboardButton(text="⬇️ Скачать песню", callback_data="download_track"),
+            InlineKeyboardButton(text="⬇️ Скачать песню",  callback_data="download_track"),
         ]
     ])
 
     photo = None
     if info.get("has_cover") or info.get("cover_data"):
         try:
-            cover_url = f"{PLAYER_URL}/cover"
+            cover_url  = f"{PLAYER_URL}/cover"
             cover_resp = requests.get(cover_url, timeout=8)
             if cover_resp.status_code == 200:
                 mime = cover_resp.headers.get("Content-Type", "image/jpeg")
-                ext = "png" if "png" in mime else "jpg"
+                ext  = "png" if "png" in mime else "jpg"
                 photo = BufferedInputFile(cover_resp.content, filename=f"cover.{ext}")
             else:
                 logger.warning("GET /cover вернул статус %d", cover_resp.status_code)
@@ -234,7 +243,7 @@ async def cmd_trigger(message, bot, backend):
         if photo is None and info.get("cover_data"):
             cover_bytes, mime = _decode_cover_to_bytes(info["cover_data"])
             if cover_bytes:
-                ext = "jpg" if "jpeg" in mime or "jpg" in mime else "png"
+                ext   = "jpg" if "jpeg" in mime or "jpg" in mime else "png"
                 photo = BufferedInputFile(cover_bytes, filename=f"cover.{ext}")
 
     if photo:
@@ -254,9 +263,9 @@ async def cmd_trigger(message, bot, backend):
 async def handle_callback(callback, bot, backend):
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-    data = callback.data
-    message = callback.message
-    chat_id = message.chat.id
+    data       = callback.data
+    message    = callback.message
+    chat_id    = message.chat.id
     message_id = message.message_id
 
     def remove_button(remove_data: str):
@@ -282,14 +291,15 @@ async def handle_callback(callback, bot, backend):
         except Exception as e:
             logger.warning("Не удалось обновить клавиатуру: %s", e)
 
-        info = _get_current_track_info(backend)
-        lyrics = (info.get("lyrics") or "").strip()
-        LOADING_MARKERS = ("Загрузка...", "⏳", "Текст песни не найден", "Ошибка")
-        has_lyrics = bool(lyrics) and not any(lyrics.startswith(m) for m in LOADING_MARKERS)
+        info    = _get_current_track_info(backend)
+        lyrics  = (info.get("lyrics") or "").strip()
+        LOADING = ("Загрузка...", "⏳", "Текст песни не найден", "Ошибка")
+        has_lyrics = bool(lyrics) and not any(lyrics.startswith(m) for m in LOADING)
 
         if not has_lyrics:
             await callback.answer("Текст ещё не загружен", show_alert=False)
-            await bot.send_message(chat_id=chat_id, text="😔 Текст пока не загружен, попробуй через пару секунд.",
+            await bot.send_message(chat_id=chat_id,
+                                   text="😔 Текст пока не загружен, попробуй через пару секунд.",
                                    reply_to_message_id=message_id)
         else:
             await callback.answer("Текст отправлен")
@@ -298,7 +308,7 @@ async def handle_callback(callback, bot, backend):
         return
 
     if data == "download_track":
-        info = _get_current_track_info(backend)
+        info   = _get_current_track_info(backend)
         new_kb = remove_button("download_track")
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=new_kb)
@@ -307,7 +317,8 @@ async def handle_callback(callback, bot, backend):
         await callback.answer()
         filepath = info.get("filepath") or ""
         if not filepath or not os.path.isfile(filepath):
-            await bot.send_message(chat_id=chat_id, text="Файл трека недоступен.", reply_to_message_id=message_id)
+            await bot.send_message(chat_id=chat_id, text="Файл трека недоступен.",
+                                   reply_to_message_id=message_id)
             return
         try:
             with open(filepath, "rb") as f:
@@ -318,26 +329,33 @@ async def handle_callback(callback, bot, backend):
                                  title=info.get("title"), performer=info.get("artist"))
         except Exception as e:
             logger.exception("Ошибка отправки файла: %s", e)
-            await bot.send_message(chat_id=chat_id, text="Не удалось отправить файл.", reply_to_message_id=message_id)
+            await bot.send_message(chat_id=chat_id, text="Не удалось отправить файл.",
+                                   reply_to_message_id=message_id)
         return
 
     await callback.answer()
 
 
 # ── Кулдауны ──────────────────────────────────────────────────────────────────
-_quote_cooldowns = {}
-_rep_cooldowns = {}
-_image_cooldowns = {}
+_quote_cooldowns  = {}
+_rep_cooldowns    = {}
+_image_cooldowns  = {}
+_ad_cooldowns     = {}
+_search_cooldowns = {}
+_music_cooldowns  = {}
+_help_cooldowns   = {}
+_meme_cooldowns   = {}
+_draw_cooldowns: dict[int, float] = {}
 
 # ── Жужа-болталка ─────────────────────────────────────────────────────────────
 _chat_mode_enabled: dict[int, bool] = {}
-_chat_history: dict[int, list] = {}
-_CHAT_HISTORY_MAX  = 30
-CHAT_ON_TRIGGER    = "жужа го говорить"
-CHAT_OFF_TRIGGER   = "жужа хватит говорить"
-CHAT_TEST_TRIGGER  = "жужа ты тут"
-CHAT_REPLY_CHANCE  = 0.35
-_CHAT_STATE_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "juza_chat_state.json")
+_chat_history:      dict[int, list] = {}
+_CHAT_HISTORY_MAX = 30
+CHAT_ON_TRIGGER   = "жужа го говорить"
+CHAT_OFF_TRIGGER  = "жужа хватит говорить"
+CHAT_TEST_TRIGGER = "жужа ты тут"
+CHAT_REPLY_CHANCE = 0.35
+_CHAT_STATE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "juza_chat_state.json")
 
 
 def _chat_state_save():
@@ -361,6 +379,7 @@ def _chat_state_load():
         logger.warning("Не удалось загрузить состояние болталки: %s", e)
 
 
+# ── Константы триггеров ───────────────────────────────────────────────────────
 QUOTE_TRIGGER      = "жужа цитату"
 QUOTE_API_URL      = "https://randomall.ru/api/gens/6381"
 QUOTE_COOLDOWN_SEC = 60
@@ -376,19 +395,15 @@ AD_COOLDOWN_SEC    = 60
 AD_CHANNEL         = "reklamarolok"
 _AD_CACHE_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ad_cache")
 _AD_CACHE_JSON     = os.path.join(_AD_CACHE_DIR, "cache.json")
-_ad_cooldowns      = {}
 
 SEARCH_TRIGGER      = "жужа найди"
 SEARCH_COOLDOWN_SEC = 30
-_search_cooldowns   = {}
 
 MUSIC_TRIGGER       = "жужа музло"
 MUSIC_COOLDOWN_SEC  = 30
-_music_cooldowns    = {}
 
 HELP_TRIGGER        = "жужа шо можешь"
 HELP_COOLDOWN_SEC   = 10
-_help_cooldowns     = {}
 
 HELP_TEXT = (
     "<pre>"
@@ -407,10 +422,9 @@ HELP_TEXT = (
     "</pre>"
 )
 
-MEME_TRIGGER        = "жужа мем мелстрой"
-MEME_COOLDOWN_SEC   = 60
-MEME_PLAYLIST_ID    = "PLxlt0ae8BD2whwfIfPGtwtn7sOami7s7b"
-_meme_cooldowns     = {}
+MEME_TRIGGER     = "жужа мем мелстрой"
+MEME_COOLDOWN_SEC = 60
+MEME_PLAYLIST_ID = "PLxlt0ae8BD2whwfIfPGtwtn7sOami7s7b"
 
 HF_MODELS = [
     "stabilityai/stable-diffusion-3.5-medium",
@@ -421,43 +435,29 @@ HF_MODELS = [
 ]
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 
-# ── Генерация картинок ─────────────────────────────────────────────────────────
-DRAW_TRIGGER         = "жужа нарисуй"
-DRAW_COOLDOWN_SEC    = 60       # личный кулдаун пользователя
-_draw_cooldowns: dict[int, float] = {}
-
-# Лимит на чат: не более DRAW_CHAT_LIMIT картинок за DRAW_CHAT_WINDOW секунд от всех
+# ── Лимит картинок на чат ─────────────────────────────────────────────────────
+DRAW_TRIGGER    = "жужа нарисуй"
+DRAW_COOLDOWN_SEC = 60
 _draw_chat_timestamps: dict[int, list] = defaultdict(list)
 DRAW_CHAT_LIMIT  = 2
 DRAW_CHAT_WINDOW = 60.0
 
-REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
-TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
-
 
 def _draw_chat_check_and_record(chat_id: int) -> tuple:
-    """
-    Проверяет лимит картинок для чата.
-    Если лимит не превышен — добавляет метку и возвращает (True, 0).
-    Если превышен — возвращает (False, секунд_до_сброса).
-    """
     now = time.time()
-    ts = _draw_chat_timestamps[chat_id]
+    ts  = _draw_chat_timestamps[chat_id]
     ts[:] = [t for t in ts if now - t < DRAW_CHAT_WINDOW]
-
     if len(ts) >= DRAW_CHAT_LIMIT:
         wait = int(DRAW_CHAT_WINDOW - (now - min(ts))) + 1
         return False, wait
-
     ts.append(now)
     return True, 0
 
 
-# ── Функции генерации изображений ─────────────────────────────────────────────
+# ── Генерация изображений ─────────────────────────────────────────────────────
 
-# ── Локальная генерация через diffusers (Stable Diffusion) ────────────────────
-_sd_pipeline = None       # кэш пайплайна (загружается один раз)
-_sd_pipe_lock = None      # asyncio.Lock, создаётся при первом использовании
+_sd_pipeline = None
+_sd_pipe_lock = None
 
 def _sd_lock():
     global _sd_pipe_lock
@@ -467,11 +467,6 @@ def _sd_lock():
 
 
 def _try_load_sd_pipeline():
-    """
-    Пробует загрузить SD пайплайн локально.
-    Порядок: любая уже скачанная модель → скачать реалистичную (небольшая).
-    Возвращает pipeline или None если diffusers не установлен / нет памяти.
-    """
     global _sd_pipeline
     if _sd_pipeline is not None:
         return _sd_pipeline
@@ -482,17 +477,16 @@ def _try_load_sd_pipeline():
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype  = torch.float16 if device == "cuda" else torch.float32
-        logger.info(f"SD: загружаем модель на {device} ({dtype})")
+        logger.info("SD: загружаем модель на %s (%s)", device, dtype)
 
         model_ids = [
-            "stablediffusionapi/realistic-vision-v51",   # ~2GB, реалистичные
-            "runwayml/stable-diffusion-v1-5",            # ~4GB, стандарт
-            "CompVis/stable-diffusion-v1-4",             # ~4GB, классика
+            "stablediffusionapi/realistic-vision-v51",
+            "runwayml/stable-diffusion-v1-5",
+            "CompVis/stable-diffusion-v1-4",
         ]
-
         for model_id in model_ids:
             try:
-                logger.info(f"SD: пробуем {model_id}...")
+                logger.info("SD: пробуем %s...", model_id)
                 pipe = StableDiffusionPipeline.from_pretrained(
                     model_id,
                     torch_dtype=dtype,
@@ -505,28 +499,22 @@ def _try_load_sd_pipeline():
                     pipe.enable_attention_slicing()
                 pipe = pipe.to(device)
                 _sd_pipeline = pipe
-                logger.info(f"SD: модель {model_id} загружена ✓")
+                logger.info("SD: модель %s загружена ✓", model_id)
                 return pipe
             except Exception as e:
-                logger.warning(f"SD: {model_id} не удалось загрузить: {e}")
+                logger.warning("SD: %s не удалось загрузить: %s", model_id, e)
                 gc.collect()
-                continue
-
         logger.warning("SD: ни одна модель не загрузилась")
         return None
     except ImportError:
-        logger.info("SD: diffusers/torch не установлены — локальная генерация недоступна")
+        logger.info("SD: diffusers/torch не установлены")
         return None
     except Exception as e:
-        logger.warning(f"SD: ошибка загрузки пайплайна: {e}")
+        logger.warning("SD: ошибка загрузки пайплайна: %s", e)
         return None
 
 
 async def generate_image_local(prompt: str) -> tuple:
-    """
-    Локальная генерация через Stable Diffusion (diffusers).
-    Возвращает (image_bytes, error_message).
-    """
     import io
     async with _sd_lock():
         loop = asyncio.get_event_loop()
@@ -536,56 +524,39 @@ async def generate_image_local(prompt: str) -> tuple:
                 return None, "SD не установлен"
 
             def _gen():
-                import torch
-                result = pipe(
-                    prompt,
-                    num_inference_steps=25,
-                    guidance_scale=7.5,
-                    width=512,
-                    height=512,
-                ).images[0]
+                result = pipe(prompt, num_inference_steps=25, guidance_scale=7.5,
+                              width=512, height=512).images[0]
                 buf = io.BytesIO()
                 result.save(buf, format="PNG")
                 return buf.getvalue()
 
             logger.info("SD: генерируем локально...")
             image_bytes = await loop.run_in_executor(None, _gen)
-            logger.info(f"SD: готово ({len(image_bytes)//1024}KB) ✓")
+            logger.info("SD: готово (%dKB) ✓", len(image_bytes) // 1024)
             return image_bytes, None
         except Exception as e:
-            logger.warning(f"SD: ошибка генерации: {e}")
+            logger.warning("SD: ошибка генерации: %s", e)
             return None, str(e)[:100]
 
 
 async def generate_image_g4f(prompt: str) -> tuple:
-    """
-    Генерация через g4f (gpt4free) — FLUX модель, бесплатно, без токенов.
-    Возвращает (image_bytes, error_str).
-    Установка: pip install g4f
-    """
+    """Генерация через g4f (gpt4free) — FLUX, бесплатно."""
     import aiohttp
-
     try:
         from g4f.client import Client as G4FClient
     except ImportError:
         return None, "g4f не установлен (pip install g4f)"
-
     try:
         loop = asyncio.get_event_loop()
 
         def _gen():
             client = G4FClient()
-            response = client.images.generate(
-                model="flux",
-                prompt=prompt,
-                response_format="url",
-            )
+            response = client.images.generate(model="flux", prompt=prompt, response_format="url")
             return response.data[0].url
 
         img_url = await loop.run_in_executor(None, _gen)
         if not img_url:
             return None, "g4f: пустой URL"
-
         logger.info("g4f FLUX: получен URL, скачиваем...")
         async with aiohttp.ClientSession() as session:
             async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
@@ -595,7 +566,6 @@ async def generate_image_g4f(prompt: str) -> tuple:
                         logger.info("g4f FLUX: ✓ %dKB", len(image_bytes) // 1024)
                         return image_bytes, None
                 return None, f"g4f: не удалось скачать картинку (HTTP {resp.status})"
-
     except Exception as e:
         logger.warning("g4f exception: %s", e)
         return None, f"g4f: {str(e)[:100]}"
@@ -603,10 +573,8 @@ async def generate_image_g4f(prompt: str) -> tuple:
 
 async def generate_image_gemini(prompt: str) -> tuple:
     import aiohttp, base64 as _b64
-
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY не задан"
-
     GEMINI_IMAGE_MODELS = [
         "gemini-2.0-flash-exp-image-generation",
         "gemini-2.0-flash-preview-image-generation",
@@ -616,7 +584,6 @@ async def generate_image_gemini(prompt: str) -> tuple:
         "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
         "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
     }
-
     last_err = "все модели недоступны"
     try:
         async with aiohttp.ClientSession() as session:
@@ -649,15 +616,12 @@ async def generate_image_gemini(prompt: str) -> tuple:
 
 async def generate_image_together(prompt: str) -> tuple:
     import aiohttp
-
     if not TOGETHER_API_TOKEN:
         return None, "TOGETHER_API_TOKEN не задан"
-
     headers = {"Authorization": f"Bearer {TOGETHER_API_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "model": "black-forest-labs/FLUX.1-schnell-Free",
-        "prompt": prompt,
-        "width": 1024, "height": 1024, "steps": 4, "n": 1,
+        "prompt": prompt, "width": 1024, "height": 1024, "steps": 4, "n": 1,
         "response_format": "b64_json",
     }
     try:
@@ -666,7 +630,7 @@ async def generate_image_together(prompt: str) -> tuple:
                                     timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    b64 = (data.get("data") or [{}])[0].get("b64_json", "")
+                    b64  = (data.get("data") or [{}])[0].get("b64_json", "")
                     if b64:
                         import base64 as _b64
                         image_bytes = _b64.b64decode(b64)
@@ -683,9 +647,7 @@ async def generate_image_together(prompt: str) -> tuple:
 async def generate_image_replicate(prompt: str, width: int = 1024, height: int = 1024) -> tuple:
     if not REPLICATE_API_TOKEN:
         return None, "REPLICATE_API_TOKEN не задан"
-
     import aiohttp
-
     headers = {"Authorization": f"Token {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "version": "39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
@@ -703,7 +665,6 @@ async def generate_image_replicate(prompt: str, width: int = 1024, height: int =
                 prediction_id = data.get("id")
                 if not prediction_id:
                     return None, "Replicate: не получен prediction ID"
-
             poll_url = f"https://api.replicate.com/v1/predictions/{prediction_id}"
             for _ in range(40):
                 await asyncio.sleep(3)
@@ -712,9 +673,9 @@ async def generate_image_replicate(prompt: str, width: int = 1024, height: int =
                     if chk.status != 200:
                         continue
                     chk_data = await chk.json()
-                    status = chk_data.get("status")
+                    status   = chk_data.get("status")
                     if status == "succeeded":
-                        output = chk_data.get("output")
+                        output  = chk_data.get("output")
                         img_url = output[0] if isinstance(output, list) and output else output
                         if not img_url:
                             return None, "Replicate: пустой output"
@@ -731,9 +692,8 @@ async def generate_image_replicate(prompt: str, width: int = 1024, height: int =
 
 async def generate_image_stable_horde(prompt: str) -> tuple:
     import aiohttp
-
     api_key = _config("STABLE_HORDE_TOKEN", "0000000000")
-    base = "https://stablehorde.net/api/v2"
+    base    = "https://stablehorde.net/api/v2"
     payload = {
         "prompt": prompt,
         "params": {"sampler_name": "k_euler_a", "cfg_scale": 7, "steps": 25,
@@ -741,18 +701,16 @@ async def generate_image_stable_horde(prompt: str) -> tuple:
         "models": ["Deliberate"], "r2": True, "shared": False,
     }
     headers = {"apikey": api_key, "Content-Type": "application/json", "Client-Agent": "telegram_bot:1.0"}
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{base}/generate/async", json=payload, headers=headers,
                                     timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status not in (200, 202):
                     return None, None
-                data = await resp.json()
+                data   = await resp.json()
                 job_id = data.get("id")
                 if not job_id:
                     return None, None
-
             for _ in range(40):
                 await asyncio.sleep(3)
                 try:
@@ -767,12 +725,11 @@ async def generate_image_stable_horde(prompt: str) -> tuple:
                             continue
                 except Exception:
                     continue
-
                 async with session.get(f"{base}/generate/status/{job_id}", headers=headers,
                                        timeout=aiohttp.ClientTimeout(total=15)) as res:
                     if res.status != 200:
                         return None, None
-                    res_data = await res.json()
+                    res_data    = await res.json()
                     generations = res_data.get("generations", [])
                     if not generations:
                         return None, None
@@ -785,7 +742,6 @@ async def generate_image_stable_horde(prompt: str) -> tuple:
                             if len(image_bytes) > 1000:
                                 logger.info("✓ Stable Horde")
                                 return image_bytes, None
-
             return None, None
     except Exception as e:
         logger.warning("Stable Horde exception: %s", e)
@@ -794,20 +750,18 @@ async def generate_image_stable_horde(prompt: str) -> tuple:
 
 async def generate_image_pollinations(prompt: str) -> tuple:
     import aiohttp, urllib.parse
-
     last_error = "все сервисы недоступны"
-    encoded = urllib.parse.quote(prompt)
-    seed = random.randint(1, 999999)
+    encoded    = urllib.parse.quote(prompt)
+    seed       = random.randint(1, 999999)
     hdrs = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://pollinations.ai/",
+        "Referer":    "https://pollinations.ai/",
     }
-
     for model in ("flux", "flux-schnell", "turbo"):
         url = (f"https://image.pollinations.ai/prompt/{encoded}"
                f"?model={model}&width=1024&height=1024&nologo=true&seed={seed}")
         try:
-            logger.info(f"Pollinations model={model}...")
+            logger.info("Pollinations model=%s...", model)
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(url, headers=hdrs, timeout=aiohttp.ClientTimeout(total=90),
                                     allow_redirects=True) as r:
@@ -816,7 +770,7 @@ async def generate_image_pollinations(prompt: str) -> tuple:
                         if "image" in ct or "octet" in ct:
                             data = await r.read()
                             if len(data) > 5000:
-                                logger.info(f"✓ Pollinations {model}")
+                                logger.info("✓ Pollinations %s", model)
                                 return data, None
                     last_error = f"Pollinations/{model}: HTTP {r.status}"
                     if r.status == 530:
@@ -839,17 +793,14 @@ async def generate_image_pollinations(prompt: str) -> tuple:
 
 async def generate_image_huggingface(prompt: str) -> tuple:
     import aiohttp
-
     if not HUGGINGFACE_TOKEN:
         return None, "HF token не задан"
-
     headers = {
         "Authorization": f"Bearer {HUGGINGFACE_TOKEN}",
-        "Accept": "image/png",
-        "Content-Type": "application/json",
+        "Accept":        "image/png",
+        "Content-Type":  "application/json",
     }
     payload = {"inputs": prompt, "parameters": {"num_inference_steps": 25}}
-
     for model in HF_MODELS:
         try:
             async with aiohttp.ClientSession() as sess:
@@ -862,68 +813,57 @@ async def generate_image_huggingface(prompt: str) -> tuple:
                     if r.status in (401, 403):
                         return None, "❌ HF: неверный токен"
         except Exception as e:
-            logger.warning(f"HF exception: {e}")
-
+            logger.warning("HF exception: %s", e)
     return None, "❌ HuggingFace недоступен"
 
 
+# ── Скачивание музыки (оптимизировано для Railway) ────────────────────────────
+
 async def download_music_by_query(query: str):
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError:
-        import subprocess, sys
-        subprocess.run([sys.executable, "-m", "pip", "install", "yt-dlp"], check=True)
-        from yt_dlp import YoutubeDL
-
+    """
+    Скачивает аудио по запросу через yt-dlp.
+    Использует subprocess (более надёжно на серверах), iOS user-agent,
+    cookies.txt для обхода ограничений YouTube.
+    """
     tmpdir = tempfile.mkdtemp(prefix="juza_music_")
-    outtmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
-
-    YTDLP_HEADERS = {
-        "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    base_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "geo_bypass": True,
-        "extractor_args": {"youtube": {"player_client": ["ios", "android"]}},
-        "http_headers": YTDLP_HEADERS,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
-        "max_filesize": 48 * 1024 * 1024,
-        "socket_timeout": 30,
-        "retries": 3,
-    }
-    loop = asyncio.get_event_loop()
+    loop   = asyncio.get_event_loop()
 
     def _download():
         import subprocess as _sp
-        last_error = ""
+        import shutil as _sh
 
-        # Шаг 1: ищем через subprocess yt-dlp
+        last_error = ""
         entries_to_try = []
+
+        # Шаг 1: Поиск через yt-dlp --flat-playlist
         try:
             result = _sp.run(
-                ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
-                 "--no-warnings", "--default-search", "ytsearch5", query],
-                capture_output=True, text=True, timeout=30
+                [
+                    "yt-dlp", "--flat-playlist",
+                    "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
+                    "--no-warnings", "--default-search", "ytsearch5",
+                    query,
+                ],
+                capture_output=True, text=True, timeout=30,
             )
             logger.info("yt-dlp search stdout: %r", result.stdout[:300])
-            logger.info("yt-dlp search stderr: %r", result.stderr[:300])
+            if result.stderr:
+                logger.info("yt-dlp search stderr: %r", result.stderr[:300])
+
             for line in result.stdout.splitlines():
                 parts = line.strip().split("\t")
                 if len(parts) >= 2 and parts[0].strip():
-                    vid_id = parts[0].strip()
-                    title = parts[1].strip() if len(parts) > 1 else query
+                    vid_id   = parts[0].strip()
+                    title    = parts[1].strip() if len(parts) > 1 else query
                     uploader = parts[2].strip() if len(parts) > 2 else ""
                     try:
                         duration = int(parts[3]) if len(parts) > 3 else 0
                     except Exception:
                         duration = 0
-                    entries_to_try.append((f"https://www.youtube.com/watch?v={vid_id}", title, uploader, duration))
+                    entries_to_try.append((
+                        f"https://www.youtube.com/watch?v={vid_id}",
+                        title, uploader, duration,
+                    ))
             if not entries_to_try and result.stderr:
                 last_error = result.stderr.strip()[-300:]
         except Exception as e:
@@ -935,30 +875,50 @@ async def download_music_by_query(query: str):
 
         logger.info("yt-dlp found %d entries, first: %s", len(entries_to_try), entries_to_try[0][1])
 
-        # Шаг 2: скачиваем первый успешный через subprocess
+        # cookies.txt рядом со скриптом
+        cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+        cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
+        if cookies_args:
+            logger.info("Используем cookies.txt: %s", cookies_path)
+
+        # Шаг 2: Скачиваем первый доступный трек
         for url, title, uploader, duration in entries_to_try[:5]:
             try:
                 out_template = os.path.join(tmpdir, "track.%(ext)s")
-                cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-                cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
                 dl_result = _sp.run(
-                    ["yt-dlp", "-f", "bestaudio/best",
-                     "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-                     "--no-playlist", "--no-warnings", "--max-filesize", "48m",
-                     *cookies_args,
-                     "-o", out_template, url],
-                    capture_output=True, text=True, timeout=120
+                    [
+                        "yt-dlp",
+                        "-f", "bestaudio/best",
+                        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+                        "--no-playlist", "--no-warnings",
+                        "--max-filesize", "48m",
+                        "--socket-timeout", "30",
+                        "--retries", "3",
+                        # iOS user-agent — снижает вероятность блокировки
+                        "--add-header",
+                        "User-Agent:com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+                        "--extractor-args", "youtube:player_client=ios,android",
+                        *cookies_args,
+                        "-o", out_template,
+                        url,
+                    ],
+                    capture_output=True, text=True, timeout=180,
                 )
-                logger.info("yt-dlp download stderr: %r", dl_result.stderr[:300])
+                if dl_result.stderr:
+                    logger.info("yt-dlp download stderr: %r", dl_result.stderr[:300])
+
                 files_in_dir = os.listdir(tmpdir)
-                logger.info("Files in tmpdir after download: %s", files_in_dir)
+                logger.info("Files in tmpdir: %s", files_in_dir)
+
                 for fname in files_in_dir:
                     if fname.endswith(".mp3"):
                         fpath = os.path.join(tmpdir, fname)
                         with open(fpath, "rb") as f:
                             audio_bytes = f.read()
                         os.remove(fpath)
+                        logger.info("Music downloaded: %dKB, title=%s", len(audio_bytes) // 1024, title)
                         return audio_bytes, title, uploader, duration
+
                 if dl_result.stderr:
                     last_error = dl_result.stderr.strip()[-300:]
             except Exception as e:
@@ -979,9 +939,10 @@ async def download_music_by_query(query: str):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ── Поиск изображений (DuckDuckGo) ────────────────────────────────────────────
+
 async def search_image(query: str):
     import aiohttp, re as _re
-
     connector = aiohttp.TCPConnector(ssl=False)
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -1026,7 +987,8 @@ async def search_image(query: str):
                     continue
                 try:
                     async with session.get(img_url, headers={"User-Agent": "Mozilla/5.0"},
-                                           timeout=aiohttp.ClientTimeout(total=12), allow_redirects=True) as img_r:
+                                           timeout=aiohttp.ClientTimeout(total=12),
+                                           allow_redirects=True) as img_r:
                         if img_r.status != 200:
                             continue
                         ct = img_r.headers.get("Content-Type", "")
@@ -1037,20 +999,25 @@ async def search_image(query: str):
                             return image_bytes, (item.get("title") or "").strip() or query
                 except Exception:
                     continue
-
             return None, "не удалось скачать ни одну картинку"
     except Exception as e:
         return None, str(e)[:120]
 
 
+# ── Мем Мелстрой ─────────────────────────────────────────────────────────────
+
 async def fetch_meme_melstroy() -> tuple:
     import subprocess, glob
-
     playlist_url = f"https://www.youtube.com/playlist?list={MEME_PLAYLIST_ID}"
+    # cookies
+    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
+
     try:
         result = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s", "--no-warnings", playlist_url],
-            capture_output=True, text=True, timeout=30
+            ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s",
+             "--no-warnings", *cookies_args, playlist_url],
+            capture_output=True, text=True, timeout=30,
         )
         lines = [l.strip() for l in result.stdout.splitlines() if "\t" in l]
     except FileNotFoundError:
@@ -1074,11 +1041,17 @@ async def fetch_meme_melstroy() -> tuple:
             out_template = os.path.join(tmpdir, "meme.%(ext)s")
             try:
                 subprocess.run(
-                    ["yt-dlp", "-f",
-                     "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best",
-                     "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
-                     "-o", out_template, f"https://www.youtube.com/watch?v={vid_id}"],
-                    capture_output=True, text=True, timeout=120
+                    [
+                        "yt-dlp",
+                        "-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
+                              "/best[height<=480][ext=mp4]/best[height<=480]/best",
+                        "--merge-output-format", "mp4",
+                        "--no-playlist", "--no-warnings",
+                        *cookies_args,
+                        "-o", out_template,
+                        f"https://www.youtube.com/watch?v={vid_id}",
+                    ],
+                    capture_output=True, text=True, timeout=120,
                 )
             except Exception:
                 continue
@@ -1096,6 +1069,8 @@ async def fetch_meme_melstroy() -> tuple:
 
     return None, "Не удалось скачать ни одно видео"
 
+
+# ── Цитата ────────────────────────────────────────────────────────────────────
 
 async def fetch_random_quote() -> str:
     try:
@@ -1118,6 +1093,8 @@ async def fetch_random_quote() -> str:
         return ""
 
 
+# ── Перевод промпта ───────────────────────────────────────────────────────────
+
 async def translate_prompt_to_english(prompt: str) -> str:
     latin_chars = sum(1 for c in prompt if c.isascii() and c.isalpha())
     total_chars = sum(1 for c in prompt if c.isalpha())
@@ -1130,11 +1107,11 @@ async def translate_prompt_to_english(prompt: str) -> str:
             async with session.get(
                 "https://translate.googleapis.com/translate_a/single",
                 params=params, timeout=aiohttp.ClientTimeout(total=8),
-                headers={"User-Agent": "Mozilla/5.0"}
+                headers={"User-Agent": "Mozilla/5.0"},
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    parts = data[0] if data else []
+                    data       = await resp.json(content_type=None)
+                    parts      = data[0] if data else []
                     translated = "".join(p[0] for p in parts if p and p[0])
                     if translated:
                         logger.info("Промпт переведён: '%s' → '%s'", prompt, translated)
@@ -1144,7 +1121,7 @@ async def translate_prompt_to_english(prompt: str) -> str:
     return prompt
 
 
-# ── Локальный движок Жужи-болталки ────────────────────────────────────────────
+# ── Жужа-болталка (локальный движок) ─────────────────────────────────────────
 
 _JUZA_PHRASES_GENERIC = [
     "жужа посмотрела на {name}. мозг вышел из чата",
@@ -1193,7 +1170,6 @@ _JUZA_PHRASES_WALK = [
     "гуляйте. жужа отдохнёт от этого",
     "вышли гулять — отлично. интернету станет легче",
 ]
-
 _JUZA_PHRASES_NO = [
     "нет сказал {name}. неожиданно разумно",
     "нет — это редкий проблеск логики",
@@ -1202,7 +1178,6 @@ _JUZA_PHRASES_NO = [
     "нет — звучит как победа",
     "жужа принимает нет. и аплодирует",
 ]
-
 _JUZA_PHRASES_YES = [
     "да? смело. необдуманно. уважаю",
     "да сказал {name}. последствия уже идут",
@@ -1211,7 +1186,6 @@ _JUZA_PHRASES_YES = [
     "принято. потом не ной",
     "вот это поворот. {name} согласен. мир рушится",
 ]
-
 _JUZA_PHRASES_FOOD = [
     "еда? мозгу тоже что-нибудь дайте",
     "кушать идёте? мысль тоже покормите",
@@ -1219,7 +1193,6 @@ _JUZA_PHRASES_FOOD = [
     "пожрать — план надёжный. думать сложнее",
     "еда — единственное что у {name} получается стабильно",
 ]
-
 _JUZA_PHRASES_SLEEP = [
     "{name} иди спать. мозг перезагрузится. может быть",
     "сон — твой единственный шанс",
@@ -1227,7 +1200,6 @@ _JUZA_PHRASES_SLEEP = [
     "жужа одобряет сон. меньше сообщений",
     "ложись спать. интернет выдохнет",
 ]
-
 _JUZA_PHRASES_MUSIC = [
     "музыка — хорошо. она хотя бы со смыслом",
     "слушаешь трек? он умнее тебя",
@@ -1235,7 +1207,6 @@ _JUZA_PHRASES_MUSIC = [
     "хороший выбор. удивительно",
     "жужа бы потанцевала. но стыдно рядом с этим",
 ]
-
 _JUZA_PHRASES_LAUGH = [
     "смешно? жужа смеётся из жалости",
     "{name} смеётся. тревожно",
@@ -1243,7 +1214,6 @@ _JUZA_PHRASES_LAUGH = [
     "смешно. случайно получилось",
     "лол. интеллект не пострадал. потому что его нет",
 ]
-
 _JUZA_PHRASES_AGREE = [
     "жужа согласна. не привыкай",
     "правильно. впервые",
@@ -1251,7 +1221,6 @@ _JUZA_PHRASES_AGREE = [
     "согласна. отметим это в календаре",
     "да. мозг проснулся на секунду",
 ]
-
 _JUZA_PHRASES_BORED = [
     "скучно? попробуй подумать. нет? ладно",
     "{name} скучает. логично",
@@ -1297,9 +1266,10 @@ _JUZA_PHRASES_CONTEXT = {
     "нечего":   _JUZA_PHRASES_BORED,
 }
 
+
 def _juza_local_reply(username: str, text: str) -> str:
     name = username or "незнакомец"
-    t = text.lower()
+    t    = text.lower()
     pool = None
     for kw, phrases in _JUZA_PHRASES_CONTEXT.items():
         if kw in t:
@@ -1312,13 +1282,13 @@ def _juza_local_reply(username: str, text: str) -> str:
 
 async def juza_chat_reply(chat_id: int, username: str, text: str) -> str | None:
     logger.info("Жужа (локально): %s в чате %s", username, chat_id)
-    history = _chat_history.setdefault(chat_id, [])
+    history      = _chat_history.setdefault(chat_id, [])
     user_content = f"{username}: {text}" if username else text
     history.append({"role": "user", "content": user_content})
     while len(history) > _CHAT_HISTORY_MAX:
         history.pop(0)
     context = " ".join(m["content"] for m in history[-3:])
-    reply = _juza_local_reply(username, context)
+    reply   = _juza_local_reply(username, context)
     history.append({"role": "assistant", "content": reply})
     while len(history) > _CHAT_HISTORY_MAX:
         history.pop(0)
@@ -1332,6 +1302,8 @@ def _is_admin(user_id: int, username: str | None) -> bool:
         return True
     return False
 
+
+# ── Кэш реп-цитат ─────────────────────────────────────────────────────────────
 
 def _rep_cache_load():
     try:
@@ -1347,7 +1319,7 @@ def _rep_cache_load():
 
 
 async def _rep_cache_refresh():
-    api_id = _config("TELEGRAM_API_ID", "").strip()
+    api_id   = _config("TELEGRAM_API_ID", "").strip()
     api_hash = _config("TELEGRAM_API_HASH", "").strip()
     if not api_id or not api_hash:
         return
@@ -1367,7 +1339,7 @@ async def _rep_cache_refresh():
         channel = await client.get_entity(REP_CHANNEL)
         with_c, without_c = [], []
         async for msg in client.iter_messages(channel, limit=200):
-            text = (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
+            text     = (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
             has_photo = bool(getattr(msg, "photo", None))
             if not text and not has_photo:
                 continue
@@ -1400,7 +1372,7 @@ async def _fetch_channel_post_photo(client, channel, message_id):
 
 
 def create_rep_session():
-    api_id = _config("TELEGRAM_API_ID", "").strip()
+    api_id   = _config("TELEGRAM_API_ID", "").strip()
     api_hash = _config("TELEGRAM_API_HASH", "").strip()
     if not api_id or not api_hash:
         print("Задайте TELEGRAM_API_ID и TELEGRAM_API_HASH в .env")
@@ -1423,6 +1395,8 @@ def create_rep_session():
     asyncio.run(_run())
 
 
+# ── Кэш рекламы ──────────────────────────────────────────────────────────────
+
 def _ad_cache_load():
     try:
         if not os.path.isfile(_AD_CACHE_JSON):
@@ -1437,7 +1411,7 @@ def _ad_cache_load():
 
 
 async def _ad_cache_refresh():
-    api_id = _config("TELEGRAM_API_ID", "").strip()
+    api_id   = _config("TELEGRAM_API_ID", "").strip()
     api_hash = _config("TELEGRAM_API_HASH", "").strip()
     if not api_id or not api_hash:
         return
@@ -1446,11 +1420,9 @@ async def _ad_cache_refresh():
         from telethon.sessions import SQLiteSession
     except ImportError:
         return
-
     session_path = os.path.join(_REP_CACHE_DIR, "session")
     if not os.path.isfile(session_path + ".session"):
         return
-
     client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
     try:
         await client.connect()
@@ -1467,7 +1439,7 @@ async def _ad_cache_refresh():
             return
         cache = []
         async for msg in client.iter_messages(channel, limit=300):
-            text = (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
+            text      = (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
             has_photo = bool(getattr(msg, "photo", None))
             if not text and not has_photo:
                 continue
@@ -1483,6 +1455,8 @@ async def _ad_cache_refresh():
         await client.disconnect()
 
 
+# ── Утилиты ───────────────────────────────────────────────────────────────────
+
 def _trigger_matches(text: str, is_private: bool = False) -> bool:
     if not text:
         return False
@@ -1491,7 +1465,6 @@ def _trigger_matches(text: str, is_private: bool = False) -> bool:
 
 def _start_ngrok(domain: str):
     import subprocess, threading, shutil
-
     ngrok_bin = shutil.which("ngrok") or "/usr/local/bin/ngrok"
     if not ngrok_bin or not os.path.isfile(ngrok_bin):
         logger.warning("ngrok не найден")
@@ -1499,14 +1472,18 @@ def _start_ngrok(domain: str):
 
     def _run():
         try:
-            subprocess.Popen([ngrok_bin, "http", f"--url={domain}", "9988"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
+            subprocess.Popen(
+                [ngrok_bin, "http", f"--url={domain}", "9988"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).wait()
         except Exception as e:
             logger.warning("ngrok завершился с ошибкой: %s", e)
 
     threading.Thread(target=_run, daemon=True).start()
     logger.info("ngrok запущен в фоне → https://%s", domain)
 
+
+# ── Основной цикл бота ────────────────────────────────────────────────────────
 
 async def run_bot(backend=None):
     from aiogram import Bot, Dispatcher, F
@@ -1526,7 +1503,7 @@ async def run_bot(backend=None):
         _start_ngrok(ngrok_domain)
 
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
+    dp  = Dispatcher()
 
     def get_backend():
         return backend if backend is not None else _get_backend()
@@ -1536,6 +1513,8 @@ async def run_bot(backend=None):
         from aiogram.types import ReactionTypeEmoji
 
         user_id = message.from_user.id if message.from_user else 0
+
+        # Реакция на сообщение от владельца (10%)
         if user_id == ALLOWED_USER_ID and random.random() < 0.10:
             try:
                 await bot.set_message_reaction(
@@ -1544,6 +1523,8 @@ async def run_bot(backend=None):
                 )
             except Exception:
                 pass
+
+        # Случайная реакция (5%)
         if random.random() < 0.05:
             try:
                 emoji = random.choice(("❤", "🔥", "👍", "😂", "😢", "🤔", "👀", "💯", "🎉", "❤️‍🔥"))
@@ -1556,9 +1537,9 @@ async def run_bot(backend=None):
 
         text = (message.text or "").strip().lower()
 
-        # «Жужа шо можешь»
+        # ── жужа шо можешь ────────────────────────────────────────────────────
         if HELP_TRIGGER.lower() in text:
-            now = time.time()
+            now  = time.time()
             last = _help_cooldowns.get(user_id, 0)
             if now - last < HELP_COOLDOWN_SEC:
                 await message.reply(f"⏱️ Жди ещё {int(HELP_COOLDOWN_SEC - (now - last))} сек.")
@@ -1567,9 +1548,9 @@ async def run_bot(backend=None):
             await message.reply(HELP_TEXT, parse_mode="HTML")
             return
 
-        # «Жужа цитату»
+        # ── жужа цитату ───────────────────────────────────────────────────────
         if QUOTE_TRIGGER.lower() in text:
-            now = time.time()
+            now  = time.time()
             last = _quote_cooldowns.get(user_id, 0)
             if now - last < QUOTE_COOLDOWN_SEC:
                 await message.reply("Подожди минуту перед следующей цитатой.")
@@ -1584,9 +1565,9 @@ async def run_bot(backend=None):
                 safe_quote = safe_quote[:4000] + "..."
             await message.reply(f"<blockquote>{safe_quote}</blockquote>", parse_mode="HTML")
 
-        # «Жужа го реповать»
+        # ── жужа го реповать ─────────────────────────────────────────────────
         if REP_TRIGGER.lower() in text:
-            now = time.time()
+            now  = time.time()
             last = _rep_cooldowns.get(user_id, 0)
             if now - last < REP_COOLDOWN_SEC:
                 await message.reply("жди свинья, пока не пройдёт 60 секунд")
@@ -1601,21 +1582,21 @@ async def run_bot(backend=None):
                 return
 
             from aiogram.types import BufferedInputFile
-            item = random.choice(cache)
-            raw_text = item.get("text") or "🖤"
+            item       = random.choice(cache)
+            raw_text   = item.get("text") or "🖤"
             reply_text = clean_post_text(raw_text)
-            msg_id = item.get("message_id")
+            msg_id     = item.get("message_id")
             photo_temp_path = None
             try:
                 if msg_id:
-                    api_id = _config("TELEGRAM_API_ID", "").strip()
+                    api_id   = _config("TELEGRAM_API_ID", "").strip()
                     api_hash = _config("TELEGRAM_API_HASH", "").strip()
                     if api_id and api_hash:
                         try:
                             from telethon import TelegramClient
                             from telethon.sessions import SQLiteSession
                             session_path = os.path.join(_REP_CACHE_DIR, "session")
-                            client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
+                            client       = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
                             await client.connect()
                             if await client.is_user_authorized():
                                 channel = await client.get_entity(REP_CHANNEL)
@@ -1639,9 +1620,9 @@ async def run_bot(backend=None):
                     except OSError:
                         pass
 
-        # «Жужа рекламу»
+        # ── жужа рекламу ──────────────────────────────────────────────────────
         if AD_TRIGGER.lower() in text:
-            now = time.time()
+            now  = time.time()
             last = _ad_cooldowns.get(user_id, 0)
             if now - last < AD_COOLDOWN_SEC:
                 await message.reply("жди, рекламы много не бывает за раз")
@@ -1656,26 +1637,26 @@ async def run_bot(backend=None):
                 await message.reply(
                     "❌ Не удалось загрузить посты.\n"
                     "Запусти: <code>python -c \"from telegram_bot import create_rep_session; create_rep_session()\"</code>",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
                 )
                 return
 
             from aiogram.types import BufferedInputFile
-            item = random.choice(cache)
-            raw_text = item.get("text") or ""
+            item       = random.choice(cache)
+            raw_text   = item.get("text") or ""
             reply_text = clean_post_text(raw_text)
-            msg_id = item.get("message_id")
+            msg_id     = item.get("message_id")
             photo_temp_path = None
             try:
                 if msg_id:
-                    api_id = _config("TELEGRAM_API_ID", "").strip()
+                    api_id   = _config("TELEGRAM_API_ID", "").strip()
                     api_hash = _config("TELEGRAM_API_HASH", "").strip()
                     if api_id and api_hash:
                         try:
                             from telethon import TelegramClient
                             from telethon.sessions import SQLiteSession
                             session_path = os.path.join(_REP_CACHE_DIR, "session")
-                            client = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
+                            client       = TelegramClient(SQLiteSession(session_path), int(api_id), api_hash)
                             await client.connect()
                             if await client.is_user_authorized():
                                 channel = None
@@ -1709,9 +1690,9 @@ async def run_bot(backend=None):
                     except OSError:
                         pass
 
-        # «Жужа мем мелстрой»
+        # ── жужа мем мелстрой ─────────────────────────────────────────────────
         if MEME_TRIGGER.lower() in text:
-            now = time.time()
+            now  = time.time()
             last = _meme_cooldowns.get(user_id, 0)
             if now - last < MEME_COOLDOWN_SEC:
                 await message.reply("⏱️ Жди 60 секунд, мемы не бесконечные")
@@ -1725,8 +1706,12 @@ async def run_bot(backend=None):
                     await status_msg.edit_text(f"❌ Не получилось: {title}")
                     return
                 video_file = BufferedInputFile(video_bytes, filename="meme.mp4")
-                await message.reply_video(video=video_file, caption=f"🎭 <b>{title}</b>",
-                                          parse_mode="HTML", supports_streaming=True)
+                await message.reply_video(
+                    video=video_file,
+                    caption=f"🎭 <b>{title}</b>",
+                    parse_mode="HTML",
+                    supports_streaming=True,
+                )
                 try:
                     await status_msg.delete()
                 except Exception:
@@ -1739,19 +1724,22 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:100]}")
             return
 
-        # «Жужа музло»
+        # ── жужа музло ────────────────────────────────────────────────────────
         if MUSIC_TRIGGER.lower() in text:
-            now = time.time()
+            now  = time.time()
             last = _music_cooldowns.get(user_id, 0)
             if now - last < MUSIC_COOLDOWN_SEC:
                 await message.reply(f"⏱️ Жди ещё {int(MUSIC_COOLDOWN_SEC - (now - last))} сек.")
                 return
 
-            raw = message.text or ""
-            idx = raw.lower().find(MUSIC_TRIGGER.lower())
+            raw   = message.text or ""
+            idx   = raw.lower().find(MUSIC_TRIGGER.lower())
             query = raw[idx + len(MUSIC_TRIGGER):].strip()
             if not query:
-                await message.reply("Напиши что найти, например:\n<i>жужа музло playboi carti</i>", parse_mode="HTML")
+                await message.reply(
+                    "Напиши что найти, например:\n<i>жужа музло playboi carti</i>",
+                    parse_mode="HTML",
+                )
                 return
             if len(query) > 200:
                 await message.reply("❌ Запрос слишком длинный (макс 200 символов)")
@@ -1762,24 +1750,25 @@ async def run_bot(backend=None):
             try:
                 from aiogram.types import BufferedInputFile
                 import shutil
-                # Проверяем наличие ffmpeg
-                ffmpeg_path = shutil.which("ffmpeg")
-                ffmpeg_status = f"ffmpeg={'✓ '+ffmpeg_path if ffmpeg_path else '✗ не найден'}"
-                logger.info("Music download start: query=%r %s", query, ffmpeg_status)
+                ffmpeg_path   = shutil.which("ffmpeg")
+                ffmpeg_status = f"ffmpeg={'✓ ' + ffmpeg_path if ffmpeg_path else '✗ не найден'}"
+                logger.info("Music start: query=%r %s", query, ffmpeg_status)
 
                 audio_bytes, title, artist, duration = await download_music_by_query(query)
-                logger.info("Music download result: bytes=%s title=%r error=%r",
-                            len(audio_bytes) if audio_bytes else 0, title, None if audio_bytes else title)
+                logger.info("Music result: bytes=%s title=%r",
+                            len(audio_bytes) if audio_bytes else 0, title)
 
                 if not audio_bytes:
                     await status_msg.edit_text(
                         f"😔 Не смогла найти/скачать «{query}»\n<i>{title}</i>\n<code>{ffmpeg_status}</code>",
-                        parse_mode="HTML"
+                        parse_mode="HTML",
                     )
                     return
                 audio_file = BufferedInputFile(audio_bytes, filename=f"{title or query}.mp3")
                 await message.reply_audio(
-                    audio=audio_file, title=title or query, performer=artist or "",
+                    audio=audio_file,
+                    title=title or query,
+                    performer=artist or "",
                     duration=duration or 0,
                     caption=f"🎧 <b>{title}</b>" + (f"\n👤 {artist}" if artist else ""),
                     parse_mode="HTML",
@@ -1796,19 +1785,17 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:200]}")
             return
 
-        # ── «Жужа нарисуй» ────────────────────────────────────────────────────
+        # ── жужа нарисуй ──────────────────────────────────────────────────────
         if DRAW_TRIGGER.lower() in text:
             chat_id = message.chat.id
-            now = time.time()
+            now     = time.time()
 
-            # Личный кулдаун (1 мин на пользователя)
             last = _draw_cooldowns.get(user_id, 0)
             if now - last < DRAW_COOLDOWN_SEC:
                 remain = int(DRAW_COOLDOWN_SEC - (now - last))
                 await message.reply(f"⏱️ Подожди ещё {remain} сек.")
                 return
 
-            # Лимит чата: максимум 2 картинки в минуту от всех
             can_draw, wait_sec = _draw_chat_check_and_record(chat_id)
             if not can_draw:
                 await message.reply(
@@ -1817,16 +1804,15 @@ async def run_bot(backend=None):
                 )
                 return
 
-            raw = message.text or ""
-            idx = raw.lower().find(DRAW_TRIGGER.lower())
+            raw        = message.text or ""
+            idx        = raw.lower().find(DRAW_TRIGGER.lower())
             prompt_raw = raw[idx + len(DRAW_TRIGGER):].strip()
 
             if not prompt_raw:
                 await message.reply(
                     "Напиши что нарисовать, например:\n<i>жужа нарисуй закат на море</i>",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
                 )
-                # Промпт не задан — откатываем счётчик чата
                 _draw_chat_timestamps[chat_id].pop()
                 return
             if len(prompt_raw) > 300:
@@ -1839,29 +1825,28 @@ async def run_bot(backend=None):
 
             try:
                 from aiogram.types import BufferedInputFile
-
-                prompt_en = await translate_prompt_to_english(prompt_raw)
+                prompt_en  = await translate_prompt_to_english(prompt_raw)
                 logger.info("Draw: '%s' → '%s'", prompt_raw, prompt_en)
 
                 image_bytes = None
-                error_str = "все сервисы недоступны"
+                error_str   = "все сервисы недоступны"
 
-                # Приоритет 0: g4f (FLUX, бесплатно, без токенов)
+                # Приоритет 0: g4f FLUX (бесплатно, без токенов)
                 logger.info("Draw: пробуем g4f FLUX...")
                 image_bytes, error_str = await generate_image_g4f(prompt_en)
                 if image_bytes:
                     logger.info("Draw: ✓ g4f FLUX")
                 else:
-                    logger.warning("Draw: g4f не сработал: %s", error_str)
+                    logger.warning("Draw: g4f: %s", error_str)
 
-                # Приоритет 1: Gemini Imagen 3
+                # Приоритет 1: Gemini
                 if not image_bytes and GEMINI_API_KEY:
-                    logger.info("Draw: пробуем Gemini Imagen 3...")
+                    logger.info("Draw: пробуем Gemini...")
                     image_bytes, error_str = await generate_image_gemini(prompt_en)
                     if image_bytes:
-                        logger.info("Draw: ✓ Gemini Imagen 3")
+                        logger.info("Draw: ✓ Gemini")
                     else:
-                        logger.warning("Draw: Gemini не сработал: %s", error_str)
+                        logger.warning("Draw: Gemini: %s", error_str)
 
                 # Приоритет 2: Together AI
                 if not image_bytes and TOGETHER_API_TOKEN:
@@ -1870,7 +1855,7 @@ async def run_bot(backend=None):
                     if image_bytes:
                         logger.info("Draw: ✓ Together AI")
                     else:
-                        logger.warning("Draw: Together AI не сработал: %s", error_str)
+                        logger.warning("Draw: Together AI: %s", error_str)
 
                 # Приоритет 3: Replicate
                 if not image_bytes and REPLICATE_API_TOKEN:
@@ -1879,16 +1864,16 @@ async def run_bot(backend=None):
                     if image_bytes:
                         logger.info("Draw: ✓ Replicate")
                     else:
-                        logger.warning("Draw: Replicate не сработал: %s", error_str)
+                        logger.warning("Draw: Replicate: %s", error_str)
 
-                # Приоритет 4: Pollinations (бесплатно, без токенов)
+                # Приоритет 4: Pollinations (бесплатно)
                 if not image_bytes:
                     logger.info("Draw: пробуем Pollinations...")
                     image_bytes, error_str = await generate_image_pollinations(prompt_en)
                     if image_bytes:
                         logger.info("Draw: ✓ Pollinations")
                     else:
-                        logger.warning("Draw: Pollinations не сработал: %s", error_str)
+                        logger.warning("Draw: Pollinations: %s", error_str)
 
                 if not image_bytes:
                     await status_msg.edit_text(f"😔 Не получилось нарисовать: {error_str}")
@@ -1904,7 +1889,6 @@ async def run_bot(backend=None):
                     await status_msg.delete()
                 except Exception:
                     pass
-
             except Exception as e:
                 logger.exception("Ошибка генерации картинки: %s", e)
                 try:
@@ -1913,19 +1897,22 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:100]}")
             return
 
-        # «Жужа найди»
+        # ── жужа найди ────────────────────────────────────────────────────────
         if SEARCH_TRIGGER.lower() in text:
-            now = time.time()
+            now  = time.time()
             last = _search_cooldowns.get(user_id, 0)
             if now - last < SEARCH_COOLDOWN_SEC:
                 await message.reply("⏱️ Подожди 30 секунд.")
                 return
 
-            raw = message.text or ""
-            idx = raw.lower().find(SEARCH_TRIGGER.lower())
+            raw   = message.text or ""
+            idx   = raw.lower().find(SEARCH_TRIGGER.lower())
             query = raw[idx + len(SEARCH_TRIGGER):].strip()
             if not query:
-                await message.reply("Напиши что найти, например:\n<i>жужа найди закат на море</i>", parse_mode="HTML")
+                await message.reply(
+                    "Напиши что найти, например:\n<i>жужа найди закат на море</i>",
+                    parse_mode="HTML",
+                )
                 return
             if len(query) > 200:
                 await message.reply("❌ Запрос слишком длинный (макс 200 символов)")
@@ -1939,8 +1926,12 @@ async def run_bot(backend=None):
                     await status_msg.edit_text(f"😔 Ничего не нашла по запросу «{query}»")
                     return
                 from aiogram.types import BufferedInputFile
-                photo = BufferedInputFile(image_bytes, filename="found.jpg")
-                caption = f"<b>{description}</b>" if description and description.lower() != query.lower() else f"<i>{query}</i>"
+                photo   = BufferedInputFile(image_bytes, filename="found.jpg")
+                caption = (
+                    f"<b>{description}</b>"
+                    if description and description.lower() != query.lower()
+                    else f"<i>{query}</i>"
+                )
                 await message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
                 try:
                     await status_msg.delete()
@@ -1954,8 +1945,8 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:100]}")
 
         user_obj = message.from_user
-        uname = (user_obj.username or "") if user_obj else ""
-        chat_id = message.chat.id
+        uname    = (user_obj.username or "") if user_obj else ""
+        chat_id  = message.chat.id
 
         # ── Триггер «сгк» ─────────────────────────────────────────────────────
         if _trigger_matches(text) and user_id == ALLOWED_USER_ID:
@@ -1963,12 +1954,12 @@ async def run_bot(backend=None):
             await cmd_trigger(message, bot, be)
             return
 
-        # ── Жужа-болталка: включение / выключение ─────────────────────────────
+        # ── Болталка: включение / выключение ──────────────────────────────────
         if CHAT_ON_TRIGGER.lower() in text:
             if _is_admin(user_id, uname):
                 if not _chat_mode_enabled.get(chat_id):
                     _chat_mode_enabled[chat_id] = True
-                    _chat_history[chat_id] = []
+                    _chat_history[chat_id]      = []
                     _chat_state_save()
                     logger.info("Болталка ВКЛЮЧЕНА в чате %s", chat_id)
                     await message.reply("окей, говорю 👀")
@@ -1985,22 +1976,22 @@ async def run_bot(backend=None):
         # ── Тест-триггер ──────────────────────────────────────────────────────
         if CHAT_TEST_TRIGGER.lower() in text and _chat_mode_enabled.get(chat_id):
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
-            reply_text = await juza_chat_reply(chat_id, sender_name, message.text or "")
+            reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
             await message.reply(reply_text if reply_text else "тут, но что-то пошло не так 😔")
             return
 
-        # ── Болталка: упоминают «жужа» ────────────────────────────────────────
+        # ── Болталка: упоминание «жужа» ───────────────────────────────────────
         if "жужа" in text and _chat_mode_enabled.get(chat_id):
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
-            reply_text = await juza_chat_reply(chat_id, sender_name, message.text or "")
+            reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
             if reply_text:
                 await message.reply(reply_text)
             return
 
-        # ── Болталка: 10% спонтанный ответ ───────────────────────────────────
+        # ── Болталка: 10% спонтанный ответ ────────────────────────────────────
         if _chat_mode_enabled.get(chat_id) and random.random() < 0.10:
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
-            reply_text = await juza_chat_reply(chat_id, sender_name, message.text or "")
+            reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
             if reply_text:
                 await message.reply(reply_text)
 
@@ -2010,18 +2001,22 @@ async def run_bot(backend=None):
         await handle_callback(callback, bot, be)
 
     logger.info("Бот запущен")
-    logger.info("Токены: GEMINI=%s | TOGETHER=%s | REPLICATE=%s | HF=%s",
-                "✓" if GEMINI_API_KEY else "✗",
-                "✓" if TOGETHER_API_TOKEN else "✗",
-                "✓" if REPLICATE_API_TOKEN else "✗",
-                "✓" if HUGGINGFACE_TOKEN else "✗")
+    logger.info(
+        "Токены: GEMINI=%s | TOGETHER=%s | REPLICATE=%s | HF=%s",
+        "✓" if GEMINI_API_KEY      else "✗",
+        "✓" if TOGETHER_API_TOKEN  else "✗",
+        "✓" if REPLICATE_API_TOKEN else "✗",
+        "✓" if HUGGINGFACE_TOKEN   else "✗",
+    )
     await dp.start_polling(bot)
 
 
 def start_bot_in_thread(backend):
+    import threading
+
     def _run():
         asyncio.run(run_bot(backend))
-    import threading
+
     threading.Thread(target=_run, daemon=True).start()
     logger.info("Поток бота запущен")
 

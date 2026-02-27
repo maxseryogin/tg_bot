@@ -1,5 +1,11 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "python312"]
+nixPkgs = ["ffmpeg", "python312", "wget", "curl"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "yt-dlp --update-to stable || true"
+]
 
 [start]
 cmd = "python telegram_bot.py"
