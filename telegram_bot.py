@@ -1143,43 +1143,37 @@ async def download_music_by_query(query: str):
             tmpdir2 = tempfile.mkdtemp(prefix="juza_yt_")
             try:
                 AUDIO_FORMATS = ["140", "251", "18"]
-                for fmt in AUDIO_FORMATS:
-                    out_path = os.path.join(tmpdir2, f"t{fmt}.%(ext)s")
-                    r = _sp.run(
-                        ["yt-dlp", "--no-playlist", "--no-warnings",
-                         "--max-filesize", "48m", "--socket-timeout", "30", "--retries", "2",
-                         "-f", fmt, *cookies_args, "-o", out_path, entry["url"]],
-                        capture_output=True, text=True, timeout=120,
-                    )
-                    
-                    if r.stderr:
-                        logger.info("YT stderr (fmt %s): %r", fmt, r.stderr[:150])
-                    
-                    if "not available" in (r.stderr or "") or "Requested format" in (r.stderr or ""):
-                        last_error = r.stderr.strip()[-150:] if r.stderr else f"Формат {fmt} недоступен"
-                        continue
+                out_path = os.path.join(tmpdir2, "track.%(ext)s")
+                r = _sp.run(
+                    ["yt-dlp", "--no-playlist", "--no-warnings",
+                    "--max-filesize", "48m", "--socket-timeout", "30", "--retries", "3",
+                    "-f", "ba/b", *cookies_args, "-o", out_path, entry["url"]],
+                    capture_output=True, text=True, timeout=120,
+                )
 
-                    files = glob.glob(os.path.join(tmpdir2, f"t{fmt}.*"))
-                    if not files:
-                        last_error = f"Файл для формата {fmt} не создан"
-                        continue
+                if r.returncode != 0:
+                    last_error = r.stderr.strip()[-150:] if r.stderr else "Ошибка yt-dlp"
+                    continue # Переходим к следующему результату поиска
 
-                    fpath = files[0]
-                    dst = os.path.join(tmpdir2, "out.mp3")
-                    
-                    conv = _sp.run(
-                        ["ffmpeg", "-y", "-i", fpath, 
-                         "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
-                        capture_output=True, timeout=60
-                    )
-                    
-                    if os.path.isfile(dst):
-                        data = open(dst, "rb").read()
-                        logger.info("✓ YT+ffmpeg (fmt %s): %dKB", fmt, len(data) // 1024)
-                        return data, entry["title"], entry["uploader"], entry["duration"]
-                    else:
-                        last_error = conv.stderr.strip()[-150:] if conv.stderr else "Ошибка конвертации ffmpeg"
+                # Ищем скачанный файл (он может быть .webm, .m4a и т.д.)
+                import glob
+                files = glob.glob(os.path.join(tmpdir2, "track.*"))
+                if not files:
+                    last_error = "Файл не был скачан"
+                    continue
 
+                fpath = files[0]
+                dst = os.path.join(tmpdir2, "out.mp3")
+
+                # Конвертируем в mp3
+                conv = _sp.run(
+                    ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
+                    capture_output=True, timeout=60
+                )
+
+                if os.path.isfile(dst):
+                    data = open(dst, "rb").read()
+                    return data, entry["title"], entry["uploader"], entry["duration"]
             except Exception as e:
                 last_error = str(e)[:150]
             finally:
@@ -1397,12 +1391,12 @@ async def fetch_meme_melstroy() -> tuple:
                 out_path = os.path.join(tmpdir, f"v{fmt}.%(ext)s")
                 try:
                     r = subprocess.run(
-                        ["yt-dlp", "--no-playlist", "--no-warnings",
-                        "--max-filesize", "49m", "--socket-timeout", "30", "--retries", "2",
-                        "-f", fmt, *cookies_args, "-o", out_path, yt_url],
-                        capture_output=True, text=True, timeout=180,
+                        ["yt-dlp", "-f", "b[height<=480]/bv*[height<=480]+ba/b",
+                        "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
+                        "-o", out_template, f"https://www.youtube.com/watch?v={vid_id}"],
+                        capture_output=True, text=True, timeout=120
                     )
-                    stderr = r.stderr or ""
+                                        stderr = r.stderr or ""
                     if "not available" in stderr or "Requested format" in stderr:
                         logger.info("fmt=%r недоступен для %s", fmt, vid_id)
                         continue
