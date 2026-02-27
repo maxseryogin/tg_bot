@@ -839,6 +839,8 @@ async def _ytdlp_download_audio(url: str, title: str, uploader: str, duration: i
             *cookies_args,
             "-o", out_template,
             url,
+            "--js-runtimes", "node",
+            "--remote-components", "ejs:github",
         ]
         result = _sp.run(cmd, capture_output=True, text=True, timeout=200)
         if result.stderr:
