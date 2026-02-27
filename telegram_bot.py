@@ -817,63 +817,11 @@ async def generate_image_huggingface(prompt: str) -> tuple:
     return None, "❌ HuggingFace недоступен"
 
 
-# ── Скачивание музыки (оптимизировано для Railway) ────────────────────────────
-
-async def _ytdlp_download_audio(url: str, title: str, uploader: str, duration: int,
-                                cookies_args: list) -> tuple:
-    import subprocess as _sp
-    tmpdir = tempfile.mkdtemp(prefix="juza_ytdl_")
-    try:
-        out_template = os.path.join(tmpdir, "track.%(ext)s")
-        cmd = [
-            "yt-dlp",
-            "--no-playlist", "--no-warnings",
-            "--max-filesize", "48m",
-            "--socket-timeout", "30",
-            "--retries", "3",
-            *cookies_args,
-            "-o", out_template,
-            url,
-            "--js-runtimes", "node",
-            "--remote-components", "ejs:github",
-        ]
-        result = _sp.run(cmd, capture_output=True, text=True, timeout=200)
-        if result.stderr:
-            logger.info("yt-dlp stderr: %r", result.stderr[:200])
-
-        files = os.listdir(tmpdir)
-        logger.info("yt-dlp files: %s", files)
-
-        audio_exts = (".mp3", ".m4a", ".webm", ".ogg", ".opus", ".aac", ".wav", ".flac", ".mp4")
-        for fname in files:
-            fpath = os.path.join(tmpdir, fname)
-            if fname.endswith(".mp3"):
-                data = open(fpath, "rb").read()
-                logger.info("✓ yt-dlp mp3: %dKB", len(data) // 1024)
-                return data, title, uploader, duration
-            if any(fname.endswith(e) for e in audio_exts):
-                dst = os.path.join(tmpdir, "out.mp3")
-                conv = _sp.run(
-                    ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
-                    capture_output=True, timeout=120,
-                )
-                if conv.returncode == 0 and os.path.isfile(dst):
-                    data = open(dst, "rb").read()
-                    logger.info("✓ yt-dlp+ffmpeg: %dKB", len(data) // 1024)
-                    return data, title, uploader, duration
-
-        err = result.stderr.strip()[-200:] if result.stderr else "файл не создан"
-        return None, err, None, None
-    except Exception as e:
-        return None, str(e)[:200], None, None
-    finally:
-        import shutil as _sh
-        _sh.rmtree(tmpdir, ignore_errors=True)
-
+# ── Скачивание музыки ─────────────────────────────────────────────────────────
 
 async def _cobalt_download(query: str) -> tuple:
     """
-    Скачивает через cobalt.tools API — работает с серверных IP без cookies.
+    Скачивает через cobalt.tools API.
     Сначала ищем видео через yt-dlp --flat-playlist, потом отдаём URL в cobalt.
     """
     import aiohttp, subprocess as _sp
@@ -902,14 +850,12 @@ async def _cobalt_download(query: str) -> tuple:
     if not entries:
         return None, "ничего не найдено", None, None
 
-    # ── FIX: обновлённый список инстанций cobalt ──────────────────────────────
     COBALT_INSTANCES = [
         "https://api.cobalt.tools",
         "https://cobalt.imput.net",
         "https://cbl.henhen1227.com",
         "https://cobalt.tools",
     ]
-    # ── FIX: правильные заголовки для cobalt API v10+ ─────────────────────────
     headers = {
         "Accept":       "application/json",
         "Content-Type": "application/json",
@@ -994,134 +940,25 @@ async def _cobalt_download(query: str) -> tuple:
     return None, "cobalt: все инстанции недоступны", None, None
 
 
-async def _soundcloud_download(query: str) -> tuple:
+async def _youtube_download(query: str) -> tuple:
+    """
+    Скачивает аудио напрямую с YouTube через yt-dlp + ffmpeg.
+    Основной метод для Railway (без SoundCloud).
+    """
     import subprocess as _sp
-    tmpdir = tempfile.mkdtemp(prefix="juza_sc_")
-    try:
-        out_template = os.path.join(tmpdir, "track.%(ext)s")
-        sc_query = f"scsearch3:{query}"
-        logger.info("SoundCloud: поиск '%s'", query)
-
-        search = _sp.run(
-            ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
-             "--no-warnings", sc_query],
-            capture_output=True, text=True, timeout=20,
-        )
-        entries = []
-        for line in search.stdout.splitlines():
-            parts = line.strip().split("\t")
-            if len(parts) >= 2 and parts[0].strip():
-                entries.append({
-                    "id":       parts[0].strip(),
-                    "title":    parts[1].strip() if len(parts) > 1 else query,
-                    "uploader": parts[2].strip() if len(parts) > 2 else "",
-                    "duration": int(parts[3]) if len(parts) > 3 and parts[3].strip().isdigit() else 0,
-                    "url":      parts[0].strip() if parts[0].startswith("http") else f"https://soundcloud.com/{parts[0]}",
-                })
-        logger.info("SoundCloud: найдено %d треков", len(entries))
-
-        for entry in entries[:3]:
-            sc_url = entry["id"] if entry["id"].startswith("http") else f"scsearch1:{query}"
-            result = _sp.run(
-                [
-                    "yt-dlp",
-                    "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-                    "--no-playlist", "--no-warnings",
-                    "--max-filesize", "48m",
-                    "-o", out_template,
-                    sc_url,
-                ],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.stderr:
-                logger.info("SC stderr: %r", result.stderr[:150])
-
-            files = os.listdir(tmpdir)
-            for fname in files:
-                if fname.endswith(".mp3"):
-                    data = open(os.path.join(tmpdir, fname), "rb").read()
-                    logger.info("✓ SoundCloud: %dKB '%s'", len(data) // 1024, entry["title"][:30])
-                    return data, entry["title"], entry["uploader"], entry["duration"]
-                fpath = os.path.join(tmpdir, fname)
-                ext_ok = any(fname.endswith(e) for e in (".m4a", ".opus", ".ogg", ".webm", ".aac"))
-                if ext_ok:
-                    dst = os.path.join(tmpdir, "out.mp3")
-                    conv = _sp.run(
-                        ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
-                        capture_output=True, timeout=60,
-                    )
-                    if conv.returncode == 0:
-                        data = open(dst, "rb").read()
-                        logger.info("✓ SC+ffmpeg: %dKB", len(data) // 1024)
-                        return data, entry["title"], entry["uploader"], entry["duration"]
-            for fn in os.listdir(tmpdir):
-                try:
-                    os.remove(os.path.join(tmpdir, fn))
-                except OSError:
-                    pass
-
-        result = _sp.run(
-            [
-                "yt-dlp",
-                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-                "--no-playlist", "--no-warnings", "--max-filesize", "48m",
-                "-o", out_template,
-                f"scsearch1:{query}",
-            ],
-            capture_output=True, text=True, timeout=120,
-        )
-        files = os.listdir(tmpdir)
-        for fname in files:
-            if fname.endswith(".mp3"):
-                data = open(os.path.join(tmpdir, fname), "rb").read()
-                title = fname.replace(".mp3", "")
-                logger.info("✓ SC direct: %dKB", len(data) // 1024)
-                return data, title, "", 0
-
-        return None, "SoundCloud: трек не найден", None, None
-    except Exception as e:
-        return None, f"SoundCloud: {str(e)[:100]}", None, None
-    finally:
-        import shutil as _sh
-        _sh.rmtree(tmpdir, ignore_errors=True)
-
-
-async def download_music_by_query(query: str):
-    import subprocess as _sp
-    import os
-    import asyncio
-    import tempfile
     import glob
     import shutil as _sh
 
-    # Путь к кукам
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
-    
     if cookies_args:
-        logger.info("Используем cookies.txt")
+        logger.info("YouTube: используем cookies.txt")
 
-    # [1/3] Попытка через Cobalt
-    logger.info("Music [1/3]: cobalt.tools → '%s'", query)
-    result = await _cobalt_download(query)
-    if result[0]:
-        return result
-    logger.warning("cobalt.tools не сработал: %s", result[1])
-
-    # [2/3] Попытка через SoundCloud
-    logger.info("Music [2/3]: SoundCloud → '%s'", query)
-    result = await _soundcloud_download(query)
-    if result[0]:
-        return result
-    logger.warning("SoundCloud не сработал: %s", result[1])
-
-    # [3/3] Попытка через YouTube (yt-dlp)
-    logger.info("Music [3/3]: YouTube yt-dlp → '%s'", query)
     loop = asyncio.get_event_loop()
 
     def _yt_search_and_download():
+        # Поиск первых 3 подходящих видео
         try:
-            # Поиск первых 3 подходящих видео
             search = _sp.run(
                 ["yt-dlp", "--flat-playlist",
                  "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
@@ -1145,14 +982,12 @@ async def download_music_by_query(query: str):
             return None, "YouTube: ничего не найдено", None, None
 
         last_error = "не удалось скачать"
-        
-        # Перебираем результаты поиска (макс 3)
+
         for entry in entries[:3]:
             tmpdir = tempfile.mkdtemp(prefix="juza_yt_")
             try:
                 out_path_t = os.path.join(tmpdir, "track.%(ext)s")
-                
-                # Используем -f "ba/b" — yt-dlp сам выберет лучший доступный аудио-поток
+
                 r = _sp.run(
                     ["yt-dlp", "--no-playlist", "--no-warnings",
                      "--max-filesize", "50m", "--socket-timeout", "30", "--retries", "3",
@@ -1164,7 +999,6 @@ async def download_music_by_query(query: str):
                     last_error = r.stderr.strip()[-150:] if r.stderr else "ошибка yt-dlp"
                     continue
 
-                # Ищем скачанный файл (расширение может быть любым: .webm, .m4a, .opus)
                 downloaded_files = glob.glob(os.path.join(tmpdir, "track.*"))
                 if not downloaded_files:
                     last_error = "файл не найден после загрузки"
@@ -1173,9 +1007,8 @@ async def download_music_by_query(query: str):
                 fpath = downloaded_files[0]
                 dst_mp3 = os.path.join(tmpdir, "final.mp3")
 
-                # Конвертируем в MP3 (чтобы Telegram точно съел)
                 conv = _sp.run(
-                    ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", 
+                    ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100",
                      "-ac", "2", "-b:a", "128k", dst_mp3],
                     capture_output=True, timeout=90
                 )
@@ -1183,10 +1016,10 @@ async def download_music_by_query(query: str):
                 if os.path.isfile(dst_mp3):
                     with open(dst_mp3, "rb") as f:
                         data = f.read()
-                    logger.info("✓ YT+ffmpeg успех: %d KB", len(data) // 1024)
+                    logger.info("✓ YouTube+ffmpeg: %d KB '%s'", len(data) // 1024, entry["title"][:30])
                     return data, entry["title"], entry["uploader"], entry["duration"]
                 else:
-                    last_error = conv.stderr.decode(errors='ignore')[-150:] if conv.stderr else "ffmpeg не создал mp3"
+                    last_error = conv.stderr.decode(errors="ignore")[-150:] if conv.stderr else "ffmpeg не создал mp3"
 
             except Exception as e:
                 last_error = str(e)[:150]
@@ -1196,6 +1029,30 @@ async def download_music_by_query(query: str):
         return None, f"YouTube: {last_error}", None, None
 
     return await loop.run_in_executor(None, _yt_search_and_download)
+
+
+async def download_music_by_query(query: str):
+    """
+    Цепочка: [1] Cobalt → [2] YouTube yt-dlp
+    SoundCloud исключён — Railway-серверный IP плохо работает с ним.
+    """
+    # [1/2] Cobalt (быстро, без cookies)
+    logger.info("Music [1/2]: cobalt.tools → '%s'", query)
+    result = await _cobalt_download(query)
+    if result[0]:
+        return result
+    logger.warning("cobalt.tools не сработал: %s", result[1])
+
+    # [2/2] YouTube напрямую через yt-dlp + ffmpeg
+    logger.info("Music [2/2]: YouTube yt-dlp → '%s'", query)
+    result = await _youtube_download(query)
+    if result[0]:
+        return result
+    logger.warning("YouTube не сработал: %s", result[1])
+
+    return None, f"Не удалось скачать: {result[1]}", None, None
+
+
 # ── Поиск изображений (DuckDuckGo) ────────────────────────────────────────────
 
 async def search_image(query: str):
@@ -1264,20 +1121,14 @@ async def search_image(query: str):
 # ── Мем Мелстрой ─────────────────────────────────────────────────────────────
 
 async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
-    """
-    Скачивает видео через cobalt.tools — работает с серверных IP Railway.
-    Возвращает (video_bytes, title) или (None, error).
-    """
     import aiohttp, subprocess as _sp
 
-    # ── FIX: обновлённый список инстанций ────────────────────────────────────
     COBALT_INSTANCES = [
         "https://api.cobalt.tools",
         "https://cobalt.imput.net",
         "https://cbl.henhen1227.com",
         "https://cobalt.tools",
     ]
-    # ── FIX: правильные заголовки для cobalt API v10+ ────────────────────────
     headers = {
         "Accept":       "application/json",
         "Content-Type": "application/json",
@@ -1357,17 +1208,12 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
 
 
 async def fetch_meme_melstroy() -> tuple:
-    """
-    Скачивает случайный мем Мелстроя.
-    Порядок: cobalt.tools → yt-dlp с cookies (последний шанс).
-    """
     import subprocess
 
     playlist_url = f"https://www.youtube.com/playlist?list={MEME_PLAYLIST_ID}"
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
-    # Шаг 1: Получаем список видео из плейлиста
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s",
