@@ -819,189 +819,381 @@ async def generate_image_huggingface(prompt: str) -> tuple:
 
 # ── Скачивание музыки (оптимизировано для Railway) ────────────────────────────
 
-async def download_music_by_query(query: str):
+async def _ytdlp_download_audio(url: str, title: str, uploader: str, duration: int,
+                                cookies_args: list) -> tuple:
     """
-    Скачивает аудио по запросу через yt-dlp.
-    Использует subprocess (более надёжно на серверах), iOS user-agent,
-    cookies.txt для обхода ограничений YouTube.
+    Скачивает аудио через yt-dlp с ffmpeg-конвертацией.
+    Возвращает (audio_bytes, title, uploader, duration) или (None, error, None, None).
     """
-    tmpdir = tempfile.mkdtemp(prefix="juza_music_")
-    loop   = asyncio.get_event_loop()
+    import subprocess as _sp
+    tmpdir = tempfile.mkdtemp(prefix="juza_ytdl_")
+    try:
+        out_template = os.path.join(tmpdir, "track.%(ext)s")
+        # Скачиваем поток целиком без --extract-audio чтобы избежать "format not available"
+        cmd = [
+            "yt-dlp",
+            "--no-playlist", "--no-warnings",
+            "--max-filesize", "48m",
+            "--socket-timeout", "30",
+            "--retries", "3",
+            *cookies_args,
+            "-o", out_template,
+            url,
+        ]
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=200)
+        if result.stderr:
+            logger.info("yt-dlp stderr: %r", result.stderr[:200])
 
-    def _download():
-        import subprocess as _sp
+        files = os.listdir(tmpdir)
+        logger.info("yt-dlp files: %s", files)
+
+        audio_exts = (".mp3", ".m4a", ".webm", ".ogg", ".opus", ".aac", ".wav", ".flac", ".mp4")
+        for fname in files:
+            fpath = os.path.join(tmpdir, fname)
+            if fname.endswith(".mp3"):
+                data = open(fpath, "rb").read()
+                logger.info("✓ yt-dlp mp3: %dKB", len(data) // 1024)
+                return data, title, uploader, duration
+            if any(fname.endswith(e) for e in audio_exts):
+                dst = os.path.join(tmpdir, "out.mp3")
+                conv = _sp.run(
+                    ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
+                    capture_output=True, timeout=120,
+                )
+                if conv.returncode == 0 and os.path.isfile(dst):
+                    data = open(dst, "rb").read()
+                    logger.info("✓ yt-dlp+ffmpeg: %dKB", len(data) // 1024)
+                    return data, title, uploader, duration
+
+        err = result.stderr.strip()[-200:] if result.stderr else "файл не создан"
+        return None, err, None, None
+    except Exception as e:
+        return None, str(e)[:200], None, None
+    finally:
         import shutil as _sh
+        _sh.rmtree(tmpdir, ignore_errors=True)
 
-        last_error = ""
-        entries_to_try = []
 
-        # Шаг 1: Поиск через yt-dlp --flat-playlist
-        try:
+async def _cobalt_download(query: str) -> tuple:
+    """
+    Скачивает через cobalt.tools API — работает с серверных IP без cookies.
+    Сначала ищем видео через yt-dlp --flat-playlist, потом отдаём URL в cobalt.
+    """
+    import aiohttp, subprocess as _sp
+
+    # Шаг 1: найти YouTube ID через поиск
+    try:
+        result = _sp.run(
+            ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
+             "--no-warnings", "--default-search", "ytsearch3", query],
+            capture_output=True, text=True, timeout=20,
+        )
+        entries = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) >= 2 and parts[0].strip():
+                entries.append({
+                    "id":       parts[0].strip(),
+                    "title":    parts[1].strip() if len(parts) > 1 else query,
+                    "uploader": parts[2].strip() if len(parts) > 2 else "",
+                    "duration": int(parts[3]) if len(parts) > 3 and parts[3].strip().isdigit() else 0,
+                })
+        logger.info("cobalt: найдено %d видео", len(entries))
+    except Exception as e:
+        return None, f"поиск: {e}", None, None
+
+    if not entries:
+        return None, "ничего не найдено", None, None
+
+    # Шаг 2: отдаём первые 3 в cobalt.tools
+    COBALT_INSTANCES = [
+        "https://cobalt.tools",
+        "https://api.cobalt.tools",
+        "https://co.wuk.sh",
+    ]
+    headers = {
+        "Accept":       "application/json",
+        "Content-Type": "application/json",
+        "User-Agent":   "Mozilla/5.0",
+    }
+
+    for entry in entries[:3]:
+        yt_url = f"https://www.youtube.com/watch?v={entry['id']}"
+        for instance in COBALT_INSTANCES:
+            try:
+                logger.info("cobalt: %s → %s", instance, entry['title'][:40])
+                async with aiohttp.ClientSession() as session:
+                    payload = {
+                        "url":           yt_url,
+                        "downloadMode":  "audio",
+                        "audioFormat":   "mp3",
+                        "audioBitrate":  "128",
+                    }
+                    async with session.post(
+                        f"{instance}/",
+                        json=payload, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        if resp.status != 200:
+                            logger.info("cobalt %s: HTTP %d", instance, resp.status)
+                            continue
+                        data = await resp.json(content_type=None)
+                        status = data.get("status", "")
+                        logger.info("cobalt статус: %s", status)
+
+                        dl_url = None
+                        if status == "stream" or status == "redirect":
+                            dl_url = data.get("url")
+                        elif status == "tunnel":
+                            dl_url = data.get("url")
+                        elif status == "picker":
+                            # Берём первый аудио
+                            for item in data.get("picker", []):
+                                if item.get("type") == "audio":
+                                    dl_url = item.get("url")
+                                    break
+
+                        if not dl_url:
+                            logger.info("cobalt: нет URL в ответе: %s", str(data)[:100])
+                            continue
+
+                        # Скачиваем файл
+                        async with session.get(
+                            dl_url, headers={"User-Agent": "Mozilla/5.0"},
+                            timeout=aiohttp.ClientTimeout(total=60),
+                            allow_redirects=True,
+                        ) as dl_resp:
+                            if dl_resp.status != 200:
+                                logger.info("cobalt download HTTP %d", dl_resp.status)
+                                continue
+                            audio_bytes = await dl_resp.read()
+                            if len(audio_bytes) > 5000:
+                                # Конвертируем в mp3 если нужно
+                                ct = dl_resp.headers.get("Content-Type", "")
+                                if "mpeg" not in ct and "mp3" not in ct:
+                                    import subprocess as _sp2
+                                    tmpdir = tempfile.mkdtemp(prefix="juza_cob_")
+                                    try:
+                                        src = os.path.join(tmpdir, "input")
+                                        dst = os.path.join(tmpdir, "out.mp3")
+                                        open(src, "wb").write(audio_bytes)
+                                        conv = _sp2.run(
+                                            ["ffmpeg", "-y", "-i", src,
+                                             "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
+                                            capture_output=True, timeout=60,
+                                        )
+                                        if conv.returncode == 0 and os.path.isfile(dst):
+                                            audio_bytes = open(dst, "rb").read()
+                                    finally:
+                                        import shutil as _sh
+                                        _sh.rmtree(tmpdir, ignore_errors=True)
+
+                                logger.info("✓ cobalt: %dKB '%s'", len(audio_bytes) // 1024, entry['title'][:30])
+                                return audio_bytes, entry["title"], entry["uploader"], entry["duration"]
+            except asyncio.TimeoutError:
+                logger.info("cobalt %s: таймаут", instance)
+            except Exception as e:
+                logger.info("cobalt %s: %s", instance, str(e)[:80])
+
+    return None, "cobalt: все инстанции недоступны", None, None
+
+
+async def _soundcloud_download(query: str) -> tuple:
+    """
+    Скачивает через SoundCloud — работает с серверов без ограничений.
+    """
+    import subprocess as _sp
+    tmpdir = tempfile.mkdtemp(prefix="juza_sc_")
+    try:
+        out_template = os.path.join(tmpdir, "track.%(ext)s")
+        sc_query = f"scsearch3:{query}"
+        logger.info("SoundCloud: поиск '%s'", query)
+
+        # Сначала находим треки
+        search = _sp.run(
+            ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
+             "--no-warnings", sc_query],
+            capture_output=True, text=True, timeout=20,
+        )
+        entries = []
+        for line in search.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) >= 2 and parts[0].strip():
+                entries.append({
+                    "id":       parts[0].strip(),
+                    "title":    parts[1].strip() if len(parts) > 1 else query,
+                    "uploader": parts[2].strip() if len(parts) > 2 else "",
+                    "duration": int(parts[3]) if len(parts) > 3 and parts[3].strip().isdigit() else 0,
+                    "url":      parts[0].strip() if parts[0].startswith("http") else f"https://soundcloud.com/{parts[0]}",
+                })
+        logger.info("SoundCloud: найдено %d треков", len(entries))
+
+        for entry in entries[:3]:
+            # URL для SoundCloud выглядит как полный URL в id
+            sc_url = entry["id"] if entry["id"].startswith("http") else f"scsearch1:{query}"
             result = _sp.run(
                 [
-                    "yt-dlp", "--flat-playlist",
-                    "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
-                    "--no-warnings", "--default-search", "ytsearch5",
-                    query,
+                    "yt-dlp",
+                    "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+                    "--no-playlist", "--no-warnings",
+                    "--max-filesize", "48m",
+                    "-o", out_template,
+                    sc_url,
                 ],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=120,
             )
-            logger.info("yt-dlp search stdout: %r", result.stdout[:300])
             if result.stderr:
-                logger.info("yt-dlp search stderr: %r", result.stderr[:300])
+                logger.info("SC stderr: %r", result.stderr[:150])
 
-            for line in result.stdout.splitlines():
+            files = os.listdir(tmpdir)
+            for fname in files:
+                if fname.endswith(".mp3"):
+                    data = open(os.path.join(tmpdir, fname), "rb").read()
+                    logger.info("✓ SoundCloud: %dKB '%s'", len(data) // 1024, entry["title"][:30])
+                    return data, entry["title"], entry["uploader"], entry["duration"]
+                fpath = os.path.join(tmpdir, fname)
+                ext_ok = any(fname.endswith(e) for e in (".m4a", ".opus", ".ogg", ".webm", ".aac"))
+                if ext_ok:
+                    dst = os.path.join(tmpdir, "out.mp3")
+                    conv = _sp.run(
+                        ["ffmpeg", "-y", "-i", fpath, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
+                        capture_output=True, timeout=60,
+                    )
+                    if conv.returncode == 0:
+                        data = open(dst, "rb").read()
+                        logger.info("✓ SC+ffmpeg: %dKB", len(data) // 1024)
+                        return data, entry["title"], entry["uploader"], entry["duration"]
+            # Чистим для следующей попытки
+            for fn in os.listdir(tmpdir):
+                try:
+                    os.remove(os.path.join(tmpdir, fn))
+                except OSError:
+                    pass
+
+        # Фолбэк: прямой поиск через scsearch
+        result = _sp.run(
+            [
+                "yt-dlp",
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+                "--no-playlist", "--no-warnings", "--max-filesize", "48m",
+                "-o", out_template,
+                f"scsearch1:{query}",
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        files = os.listdir(tmpdir)
+        for fname in files:
+            if fname.endswith(".mp3"):
+                data = open(os.path.join(tmpdir, fname), "rb").read()
+                title = fname.replace(".mp3", "")
+                logger.info("✓ SC direct: %dKB", len(data) // 1024)
+                return data, title, "", 0
+
+        return None, "SoundCloud: трек не найден", None, None
+    except Exception as e:
+        return None, f"SoundCloud: {str(e)[:100]}", None, None
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmpdir, ignore_errors=True)
+
+
+async def download_music_by_query(query: str):
+    """
+    Скачивает аудио по запросу.
+    Порядок: cobalt.tools → SoundCloud → yt-dlp (YouTube с cookies).
+    YouTube напрямую через yt-dlp блокируется серверными IP — используется как последний шанс.
+    """
+    import subprocess as _sp
+
+    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
+    if cookies_args:
+        logger.info("Используем cookies.txt")
+
+    # ── Источник 1: cobalt.tools (работает с серверных IP) ───────────────────
+    logger.info("Music [1/3]: cobalt.tools → '%s'", query)
+    result = await _cobalt_download(query)
+    if result[0]:
+        return result
+    logger.warning("cobalt.tools не сработал: %s", result[1])
+
+    # ── Источник 2: SoundCloud (не блокирует серверные IP) ───────────────────
+    logger.info("Music [2/3]: SoundCloud → '%s'", query)
+    result = await _soundcloud_download(query)
+    if result[0]:
+        return result
+    logger.warning("SoundCloud не сработал: %s", result[1])
+
+    # ── Источник 3: YouTube через yt-dlp + cookies (последний шанс) ──────────
+    logger.info("Music [3/3]: YouTube yt-dlp → '%s'", query)
+    loop = asyncio.get_event_loop()
+
+    def _yt_search_and_download():
+        try:
+            search = _sp.run(
+                ["yt-dlp", "--flat-playlist",
+                 "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
+                 "--no-warnings", "--default-search", "ytsearch3", query],
+                capture_output=True, text=True, timeout=20,
+            )
+            entries = []
+            for line in search.stdout.splitlines():
                 parts = line.strip().split("\t")
                 if len(parts) >= 2 and parts[0].strip():
-                    vid_id   = parts[0].strip()
-                    title    = parts[1].strip() if len(parts) > 1 else query
-                    uploader = parts[2].strip() if len(parts) > 2 else ""
-                    try:
-                        duration = int(parts[3]) if len(parts) > 3 else 0
-                    except Exception:
-                        duration = 0
-                    entries_to_try.append((
-                        f"https://www.youtube.com/watch?v={vid_id}",
-                        title, uploader, duration,
-                    ))
-            if not entries_to_try and result.stderr:
-                last_error = result.stderr.strip()[-300:]
+                    entries.append({
+                        "url":      f"https://www.youtube.com/watch?v={parts[0].strip()}",
+                        "title":    parts[1].strip() if len(parts) > 1 else query,
+                        "uploader": parts[2].strip() if len(parts) > 2 else "",
+                        "duration": int(parts[3]) if len(parts) > 3 and parts[3].strip().isdigit() else 0,
+                    })
         except Exception as e:
-            last_error = str(e)[:300]
-            logger.error("yt-dlp search exception: %s", last_error)
+            return None, str(e)[:100], None, None
 
-        if not entries_to_try:
-            return None, last_error or "ничего не найдено", None, None
+        if not entries:
+            return None, "YouTube: ничего не найдено", None, None
 
-        logger.info("yt-dlp found %d entries, first: %s", len(entries_to_try), entries_to_try[0][1])
+        last_error = "не удалось скачать"
+        for entry in entries[:3]:
+            tmpdir2 = tempfile.mkdtemp(prefix="juza_yt_")
+            try:
+                out_t = os.path.join(tmpdir2, "track.%(ext)s")
+                r = _sp.run(
+                    ["yt-dlp",
+                     "--no-playlist", "--no-warnings",
+                     "--max-filesize", "48m", "--socket-timeout", "30", "--retries", "3",
+                     *cookies_args, "-o", out_t, entry["url"]],
+                    capture_output=True, text=True, timeout=200,
+                )
+                if r.stderr:
+                    logger.info("YT stderr: %r", r.stderr[:150])
+                files = os.listdir(tmpdir2)
+                audio_exts = (".mp3", ".m4a", ".webm", ".ogg", ".opus", ".aac", ".wav", ".flac", ".mp4")
+                for fname in files:
+                    fpath = os.path.join(tmpdir2, fname)
+                    if fname.endswith(".mp3"):
+                        data = open(fpath, "rb").read()
+                        return data, entry["title"], entry["uploader"], entry["duration"]
+                    if any(fname.endswith(e) for e in audio_exts):
+                        dst = os.path.join(tmpdir2, "out.mp3")
+                        conv = _sp.run(
+                            ["ffmpeg", "-y", "-i", fpath,
+                             "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", dst],
+                            capture_output=True, timeout=120,
+                        )
+                        if conv.returncode == 0 and os.path.isfile(dst):
+                            data = open(dst, "rb").read()
+                            logger.info("✓ YT+ffmpeg: %dKB", len(data) // 1024)
+                            return data, entry["title"], entry["uploader"], entry["duration"]
+                last_error = r.stderr.strip()[-150:] if r.stderr else "файл не создан"
+            except Exception as e:
+                last_error = str(e)[:150]
+            finally:
+                import shutil as _sh
+                _sh.rmtree(tmpdir2, ignore_errors=True)
 
-        # cookies.txt рядом со скриптом
-        cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-        cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
-        if cookies_args:
-            logger.info("Используем cookies.txt: %s", cookies_path)
+        return None, f"YouTube: {last_error}", None, None
 
-        # Разные наборы аргументов — пробуем по очереди если один не сработал.
-        # "Requested format is not available" = YouTube заблокировал конкретный формат для серверного IP.
-        # Решение: пробовать разные player_client и не указывать -f жёстко.
-        DOWNLOAD_STRATEGIES = [
-            # Стратегия 1: tv_embedded — обычно не блокируется, даёт форматы без ограничений
-            [
-                "--extractor-args", "youtube:player_client=tv_embedded",
-                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-            ],
-            # Стратегия 2: web_creator — ещё один незаблокированный клиент
-            [
-                "--extractor-args", "youtube:player_client=web_creator,tv_embedded",
-                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-            ],
-            # Стратегия 3: mweb (мобильный веб) — часто проходит там где desktop нет
-            [
-                "--extractor-args", "youtube:player_client=mweb,web",
-                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-            ],
-            # Стратегия 4: явно указываем форматы которые обычно есть у всех видео
-            [
-                "--extractor-args", "youtube:player_client=tv_embedded,web",
-                "-f", "140/251/250/249/171/worstaudio",
-                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-            ],
-            # Стратегия 5: compat-режим + format-sort без жёсткого -f
-            [
-                "--extractor-args", "youtube:player_client=web,android,tv_embedded,mweb",
-                "--extract-audio", "--audio-format", "mp3",
-                "--format-sort", "aext:m4a,abr",
-            ],
-            # Стратегия 6: последний шанс — скачать видео и вырезать аудио ffmpeg
-            [
-                "--extractor-args", "youtube:player_client=tv_embedded",
-                "-f", "worst[ext=mp4]/worst",
-                "--recode-video", "mp4",
-            ],
-        ]
-
-        # Шаг 2: Скачиваем первый доступный трек
-        for url, title, uploader, duration in entries_to_try[:5]:
-            for strategy_idx, strategy_args in enumerate(DOWNLOAD_STRATEGIES):
-                try:
-                    # Чистим tmpdir перед каждой попыткой
-                    for fn in os.listdir(tmpdir):
-                        try:
-                            os.remove(os.path.join(tmpdir, fn))
-                        except OSError:
-                            pass
-
-                    out_template = os.path.join(tmpdir, "track.%(ext)s")
-                    cmd = [
-                        "yt-dlp",
-                        *strategy_args,
-                        "--no-playlist", "--no-warnings",
-                        "--max-filesize", "48m",
-                        "--socket-timeout", "30",
-                        "--retries", "2",
-                        *cookies_args,
-                        "-o", out_template,
-                        url,
-                    ]
-                    logger.info("Стратегия %d: %s", strategy_idx + 1, url[:60])
-                    dl_result = _sp.run(cmd, capture_output=True, text=True, timeout=180)
-
-                    if dl_result.stderr:
-                        logger.info("stderr стратегии %d: %r", strategy_idx + 1, dl_result.stderr[:200])
-
-                    files_in_dir = os.listdir(tmpdir)
-                    logger.info("Файлы в tmpdir: %s", files_in_dir)
-
-                    # Сначала ищем mp3
-                    for fname in files_in_dir:
-                        if fname.endswith(".mp3"):
-                            fpath = os.path.join(tmpdir, fname)
-                            with open(fpath, "rb") as f:
-                                audio_bytes = f.read()
-                            os.remove(fpath)
-                            logger.info("✓ Скачано mp3: %dKB, title=%s", len(audio_bytes) // 1024, title)
-                            return audio_bytes, title, uploader, duration
-
-                    # Если mp3 нет, ищем любое аудио и конвертируем ffmpeg вручную
-                    audio_exts = (".m4a", ".webm", ".ogg", ".opus", ".aac", ".wav", ".flac", ".mp4")
-                    for fname in files_in_dir:
-                        if any(fname.endswith(ext) for ext in audio_exts):
-                            src_path = os.path.join(tmpdir, fname)
-                            dst_path = os.path.join(tmpdir, "converted.mp3")
-                            logger.info("Конвертируем %s → mp3...", fname)
-                            conv = _sp.run(
-                                ["ffmpeg", "-y", "-i", src_path,
-                                 "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k",
-                                 dst_path],
-                                capture_output=True, timeout=120,
-                            )
-                            if conv.returncode == 0 and os.path.isfile(dst_path):
-                                with open(dst_path, "rb") as f:
-                                    audio_bytes = f.read()
-                                logger.info("✓ Конвертировано: %dKB", len(audio_bytes) // 1024)
-                                return audio_bytes, title, uploader, duration
-                            else:
-                                logger.warning("ffmpeg ошибка: %r", conv.stderr[:200] if conv.stderr else "")
-
-                    if dl_result.stderr:
-                        last_error = dl_result.stderr.strip()[-300:]
-                    else:
-                        last_error = f"стратегия {strategy_idx+1}: файл не создан"
-
-                except Exception as e:
-                    last_error = str(e)[:300]
-                    logger.error("Исключение стратегии %d: %s", strategy_idx + 1, last_error)
-
-            # Если все стратегии для этого видео не сработали — пробуем следующее
-            logger.warning("Все стратегии не сработали для %s, пробуем следующее видео", url[:60])
-
-        return None, last_error or "не удалось скачать", None, None
-
-    try:
-        return await loop.run_in_executor(None, _download)
-    finally:
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    return await loop.run_in_executor(None, _yt_search_and_download)
 
 
 # ── Поиск изображений (DuckDuckGo) ────────────────────────────────────────────
@@ -1071,13 +1263,109 @@ async def search_image(query: str):
 
 # ── Мем Мелстрой ─────────────────────────────────────────────────────────────
 
+async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
+    """
+    Скачивает видео через cobalt.tools — работает с серверных IP Railway.
+    Возвращает (video_bytes, title) или (None, error).
+    """
+    import aiohttp, subprocess as _sp
+
+    COBALT_INSTANCES = [
+        "https://cobalt.tools",
+        "https://api.cobalt.tools",
+        "https://co.wuk.sh",
+    ]
+    headers = {
+        "Accept":       "application/json",
+        "Content-Type": "application/json",
+        "User-Agent":   "Mozilla/5.0",
+    }
+
+    for instance in COBALT_INSTANCES:
+        try:
+            logger.info("cobalt video: %s → %s", instance, title[:30])
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "url":          yt_url,
+                    "downloadMode": "auto",
+                    "videoQuality": "480",
+                }
+                async with session.post(
+                    f"{instance}/",
+                    json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.info("cobalt video %s: HTTP %d", instance, resp.status)
+                        continue
+                    data = await resp.json(content_type=None)
+                    status = data.get("status", "")
+
+                    dl_url = None
+                    if status in ("stream", "redirect", "tunnel"):
+                        dl_url = data.get("url")
+                    elif status == "picker":
+                        for item in data.get("picker", []):
+                            if item.get("type") == "video":
+                                dl_url = item.get("url")
+                                break
+                        if not dl_url and data.get("picker"):
+                            dl_url = data["picker"][0].get("url")
+
+                    if not dl_url:
+                        logger.info("cobalt video: нет URL: %s", str(data)[:80])
+                        continue
+
+                    async with session.get(
+                        dl_url, headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=aiohttp.ClientTimeout(total=90),
+                        allow_redirects=True,
+                    ) as dl_resp:
+                        if dl_resp.status != 200:
+                            continue
+                        video_bytes = await dl_resp.read()
+                        if len(video_bytes) > 10_000:
+                            ct = dl_resp.headers.get("Content-Type", "")
+                            # Если не mp4 — перекодируем
+                            if "mp4" not in ct:
+                                tmpdir = tempfile.mkdtemp(prefix="juza_cob_v_")
+                                try:
+                                    src = os.path.join(tmpdir, "input")
+                                    dst = os.path.join(tmpdir, "out.mp4")
+                                    open(src, "wb").write(video_bytes)
+                                    conv = _sp.run(
+                                        ["ffmpeg", "-y", "-i", src, "-c:v", "copy", "-c:a", "aac", dst],
+                                        capture_output=True, timeout=60,
+                                    )
+                                    if conv.returncode == 0 and os.path.isfile(dst):
+                                        video_bytes = open(dst, "rb").read()
+                                finally:
+                                    import shutil as _sh
+                                    _sh.rmtree(tmpdir, ignore_errors=True)
+
+                            if len(video_bytes) <= 49 * 1024 * 1024:
+                                logger.info("✓ cobalt video: %dKB", len(video_bytes) // 1024)
+                                return video_bytes, title
+        except asyncio.TimeoutError:
+            logger.info("cobalt video %s: таймаут", instance)
+        except Exception as e:
+            logger.info("cobalt video %s: %s", instance, str(e)[:60])
+
+    return None, "cobalt video: все инстанции недоступны"
+
+
 async def fetch_meme_melstroy() -> tuple:
-    import subprocess, glob
+    """
+    Скачивает случайный мем Мелстроя.
+    Порядок: cobalt.tools → yt-dlp с cookies (последний шанс).
+    """
+    import subprocess
+
     playlist_url = f"https://www.youtube.com/playlist?list={MEME_PLAYLIST_ID}"
-    # cookies
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
+    # Шаг 1: Получаем список видео из плейлиста
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s",
@@ -1085,6 +1373,8 @@ async def fetch_meme_melstroy() -> tuple:
             capture_output=True, text=True, timeout=30,
         )
         lines = [l.strip() for l in result.stdout.splitlines() if "\t" in l]
+        if result.stderr and not lines:
+            logger.warning("Плейлист stderr: %r", result.stderr[:200])
     except FileNotFoundError:
         return None, "yt-dlp не установлен"
     except subprocess.TimeoutExpired:
@@ -1095,89 +1385,51 @@ async def fetch_meme_melstroy() -> tuple:
     if not lines:
         return None, "Плейлист пустой или недоступен"
 
+    logger.info("Плейлист Мелстроя: %d видео", len(lines))
     random.shuffle(lines)
-    for entry in lines[:5]:
+
+    for entry in lines[:8]:
         parts = entry.split("\t", 1)
         if len(parts) < 2:
             continue
         vid_id, title = parts[0].strip(), parts[1].strip()
+        yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-        # Стратегии скачивания видео (те же что для музыки — обходим "format not available")
-        VIDEO_STRATEGIES = [
-            # 1: tv_embedded — не требует подтверждения возраста, обычно даёт форматы
-            [
-                "--extractor-args", "youtube:player_client=tv_embedded",
-                "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-                "--merge-output-format", "mp4",
-            ],
-            # 2: web_creator
-            [
-                "--extractor-args", "youtube:player_client=web_creator,tv_embedded",
-                "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-                "--merge-output-format", "mp4",
-            ],
-            # 3: mweb — мобильный веб
-            [
-                "--extractor-args", "youtube:player_client=mweb,web",
-                "-f", "best[height<=480]/best",
-                "--merge-output-format", "mp4",
-            ],
-            # 4: без -f, format-sort — yt-dlp сам выберет доступный
-            [
-                "--extractor-args", "youtube:player_client=tv_embedded,web",
-                "--format-sort", "res:480,ext:mp4",
-                "--merge-output-format", "mp4",
-            ],
-            # 5: полный фолбэк — берём что угодно
-            [
-                "--extractor-args", "youtube:player_client=web,tv_embedded",
-                "--merge-output-format", "mp4",
-            ],
-        ]
+        # ── Источник 1: cobalt.tools ──────────────────────────────────────────
+        video_bytes, err = await _cobalt_download_video(yt_url, title)
+        if video_bytes:
+            return video_bytes, title
+        logger.info("cobalt video не сработал для %s: %s", vid_id, err)
 
-        downloaded = False
-        for strategy_idx, strategy_args in enumerate(VIDEO_STRATEGIES):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                out_template = os.path.join(tmpdir, "meme.%(ext)s")
-                try:
-                    result_dl = subprocess.run(
-                        [
-                            "yt-dlp",
-                            *strategy_args,
-                            "--no-playlist", "--no-warnings",
-                            "--max-filesize", "49m",
-                            "--socket-timeout", "30",
-                            "--retries", "2",
-                            *cookies_args,
-                            "-o", out_template,
-                            f"https://www.youtube.com/watch?v={vid_id}",
-                        ],
-                        capture_output=True, text=True, timeout=120,
-                    )
-                    if result_dl.stderr:
-                        logger.info("Мем стратегия %d stderr: %r", strategy_idx + 1, result_dl.stderr[:150])
-                except Exception as e:
-                    logger.warning("Мем стратегия %d exception: %s", strategy_idx + 1, e)
-                    continue
+        # ── Источник 2: yt-dlp без -f (пусть сам выберет что доступно) ────────
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_template = os.path.join(tmpdir, "meme.%(ext)s")
+            try:
+                result_dl = subprocess.run(
+                    [
+                        "yt-dlp",
+                        "--no-playlist", "--no-warnings",
+                        "--max-filesize", "49m",
+                        "--socket-timeout", "30",
+                        "--retries", "2",
+                        *cookies_args,
+                        "-o", out_template,
+                        yt_url,
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result_dl.stderr:
+                    logger.info("yt-dlp meme stderr: %r", result_dl.stderr[:100])
 
+                import glob
                 files = glob.glob(os.path.join(tmpdir, "meme.*"))
-                if not files:
-                    logger.info("Мем стратегия %d: файлов нет", strategy_idx + 1)
-                    continue
-                try:
-                    with open(files[0], "rb") as f:
-                        video_bytes = f.read()
+                if files:
+                    video_bytes = open(files[0], "rb").read()
                     if 10_000 < len(video_bytes) <= 49 * 1024 * 1024:
-                        logger.info("✓ Мем стратегия %d: %dKB", strategy_idx + 1, len(video_bytes) // 1024)
+                        logger.info("✓ yt-dlp meme: %dKB", len(video_bytes) // 1024)
                         return video_bytes, title
-                    else:
-                        logger.info("Мем стратегия %d: файл слишком маленький или большой (%d bytes)",
-                                    strategy_idx + 1, len(video_bytes))
-                except Exception as e:
-                    logger.warning("Мем стратегия %d read error: %s", strategy_idx + 1, e)
-                    continue
-
-        logger.warning("Все стратегии не сработали для мема vid_id=%s", vid_id)
+            except Exception as e:
+                logger.info("yt-dlp meme exception: %s", str(e)[:60])
 
     return None, "Не удалось скачать ни одно видео"
 
