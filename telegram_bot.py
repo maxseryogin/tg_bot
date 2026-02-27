@@ -438,19 +438,17 @@ HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 # ── Лимит картинок на чат ─────────────────────────────────────────────────────
 DRAW_TRIGGER    = "жужа нарисуй"
 DRAW_COOLDOWN_SEC = 60
-_draw_chat_timestamps: dict[int, list] = defaultdict(list)
-DRAW_CHAT_LIMIT  = 2
+_draw_chat_timestamps: dict[int, float] = {}  # chat_id → последний timestamp
 DRAW_CHAT_WINDOW = 60.0
 
 
 def _draw_chat_check_and_record(chat_id: int) -> tuple:
-    now = time.time()
-    ts  = _draw_chat_timestamps[chat_id]
-    ts[:] = [t for t in ts if now - t < DRAW_CHAT_WINDOW]
-    if len(ts) >= DRAW_CHAT_LIMIT:
-        wait = int(DRAW_CHAT_WINDOW - (now - min(ts))) + 1
+    now  = time.time()
+    last = _draw_chat_timestamps.get(chat_id, 0)
+    if now - last < DRAW_CHAT_WINDOW:
+        wait = int(DRAW_CHAT_WINDOW - (now - last)) + 1
         return False, wait
-    ts.append(now)
+    _draw_chat_timestamps[chat_id] = now
     return True, 0
 
 
@@ -2012,11 +2010,11 @@ async def run_bot(backend=None):
                     "Напиши что нарисовать, например:\n<i>жужа нарисуй закат на море</i>",
                     parse_mode="HTML",
                 )
-                _draw_chat_timestamps[chat_id].pop()
+                _draw_chat_timestamps.pop(chat_id, None)
                 return
             if len(prompt_raw) > 300:
                 await message.reply("❌ Промпт слишком длинный (макс 300 символов)")
-                _draw_chat_timestamps[chat_id].pop()
+                _draw_chat_timestamps.pop(chat_id, None)
                 return
 
             _draw_cooldowns[user_id] = now
@@ -2141,7 +2139,7 @@ async def run_bot(backend=None):
         uname    = (user_obj.username or "") if user_obj else ""
         chat_id  = message.chat.id
 
-        if _trigger_matches(text) and user_id == ALLOWED_USER_ID:
+        if _trigger_matches(text):
             be = get_backend()
             await cmd_trigger(message, bot, be)
             return
@@ -2164,7 +2162,7 @@ async def run_bot(backend=None):
                 await message.reply("молчу 🤐")
             return
 
-        if CHAT_TEST_TRIGGER.lower() in text and _chat_mode_enabled.get(chat_id):
+        if CHAT_TEST_TRIGGER.lower() in text:
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
             reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
             await message.reply(reply_text if reply_text else "тут, но что-то пошло не так 😔")
