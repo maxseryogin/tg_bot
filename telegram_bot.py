@@ -607,29 +607,35 @@ async def generate_image_g4f(prompt: str) -> tuple:
         Providers, "DeepInfraImage", "DeepInfra", "DeepInfraProvider",
     )
     if di_provider:
-        try:
-            def _gen_di(prov=di_provider):
-                client = G4FClient()
-                resp = client.images.generate(
-                    model="flux",
-                    prompt=prompt,
-                    provider=prov,
-                    response_format="url",
-                )
-                return resp.data[0].url if resp.data else None
+        di_models = [
+            "black-forest-labs/FLUX-1-schnell",
+            "black-forest-labs/FLUX-1-dev",
+            "stabilityai/stable-diffusion-xl-base-1.0",
+        ]
+        for di_model in di_models:
+            try:
+                def _gen_di(prov=di_provider, m=di_model):
+                    client = G4FClient()
+                    resp = client.images.generate(
+                        model=m,
+                        prompt=prompt,
+                        provider=prov,
+                        response_format="url",
+                    )
+                    return resp.data[0].url if resp.data else None
 
-            logger.info("g4f: %s/flux...", di_name)
-            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_di), timeout=90)
-            if img_url:
-                img_bytes = await _download_image_url(img_url)
-                if img_bytes:
-                    logger.info("g4f: %s ✓ %dKB", di_name, len(img_bytes)//1024)
-                    return img_bytes, None
-        except asyncio.TimeoutError:
-            logger.warning("g4f: %s таймаут", di_name)
-        except Exception as e:
-            logger.warning("g4f: %s: %s", di_name, str(e)[:100])
-        await asyncio.sleep(random.uniform(2, 4))
+                logger.info("g4f: %s/%s...", di_name, di_model)
+                img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_di), timeout=90)
+                if img_url:
+                    img_bytes = await _download_image_url(img_url)
+                    if img_bytes:
+                        logger.info("g4f: %s/%s ✓ %dKB", di_name, di_model, len(img_bytes)//1024)
+                        return img_bytes, None
+            except asyncio.TimeoutError:
+                logger.warning("g4f: %s/%s таймаут", di_name, di_model)
+            except Exception as e:
+                logger.warning("g4f: %s/%s: %s", di_name, di_model, str(e)[:100])
+            await asyncio.sleep(random.uniform(1, 3))
     else:
         logger.warning("g4f: провайдер DeepInfra не найден в текущей версии g4f")
 
@@ -775,9 +781,8 @@ _PERCHANCE_MODES = ["pollen", "buzz", "fresh"]
 
 async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
     """
-    Генерация через Pollinations.ai (бэкенд olike на perchance.org).
-    mode: 'pollen' (flux) | 'buzz' (flux-realism) | 'fresh' (flux-anime)
-    Ключ читается из PERCHANCE_USER_KEY (токен Pollinations.ai в формате sk_...).
+    Генерация через Pollinations.ai.
+    530 = Cloudflare блокирует Railway IP => пробуем разные эндпоинты и без токена.
     """
     import aiohttp, urllib.parse
 
@@ -785,75 +790,88 @@ async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
         mode = "pollen"
 
     model = _OLIKE_MODE_MODELS.get(mode, "flux")
-
-    # Pollinations.ai API: GET /prompt/{encoded_prompt}
     encoded = urllib.parse.quote(prompt, safe="")
-    url = f"https://image.pollinations.ai/prompt/{encoded}"
-
-    params = {
-        "model":    model,
-        "width":    "1024",
-        "height":   "1024",
-        "seed":     str(random.randint(1, 2**31)),
-        "nologo":   "true",
-        "enhance":  "false",
-        "private":  "true",
-    }
-
-    # Добавляем токен если есть
     token = PERCHANCE_USER_KEY.strip()
-    if token:
-        params["token"] = token
-        logger.info("Pollinations: используем токен (len=%d), модель=%s", len(token), model)
-    else:
-        logger.info("Pollinations: без токена, модель=%s", model)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Referer":    "https://perchance.org/olike",
-        "Origin":     "https://perchance.org",
+    # Разные эндпоинты Pollinations.
+    # 530 = Cloudflare заблокировал Railway IP => пробуем разные варианты
+    base_urls = [
+        f"https://image.pollinations.ai/prompt/{encoded}",
+        # Альтернативный эндпоинт (gen.pollinations.ai — видели в DevTools)
+        f"https://gen.pollinations.ai/prompt/{encoded}",
+    ]
+
+    base_params = {
+        "model":   model,
+        "width":   "1024",
+        "height":  "1024",
+        "seed":    str(random.randint(1, 2**31)),
+        "nologo":  "true",
+        "private": "true",
     }
+    if token:
+        base_params["token"] = token
+
+    # Варианты запросов: с токеном / без
+    param_variants = [base_params.copy()]
+    if token:
+        no_token = base_params.copy()
+        del no_token["token"]
+        param_variants.append(no_token)
+
+    headers_variants = [
+        # Как от perchance.org (olike)
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer":    "https://perchance.org/olike",
+            "Origin":     "https://perchance.org",
+        },
+        # Как от обычного браузера
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        },
+    ]
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, params=params, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=120),
-                allow_redirects=True,
-            ) as resp:
-                if resp.status not in (200, 201):
-                    logger.warning("Pollinations/%s HTTP %d", model, resp.status)
-                    return None, f"Pollinations HTTP {resp.status}"
+            for url in base_urls:
+              for params in param_variants:
+                for hdrs in headers_variants:
+                    try:
+                        logger.info("Pollinations/%s: %s token=%s referer=%s",
+                                    model, url.split("/")[2],
+                                    bool(params.get("token")),
+                                    hdrs.get("Referer", "-"))
+                        async with session.get(
+                            url, params=params, headers=hdrs,
+                            timeout=aiohttp.ClientTimeout(total=120),
+                            allow_redirects=True,
+                        ) as resp:
+                            if resp.status == 530:
+                                logger.warning("Pollinations/%s: 530 Cloudflare (Railway IP заблокирован)", model)
+                                continue
+                            if resp.status not in (200, 201):
+                                logger.warning("Pollinations/%s HTTP %d", model, resp.status)
+                                continue
+                            ct = resp.headers.get("Content-Type", "")
+                            if "image" in ct or "octet" in ct:
+                                data = await resp.read()
+                                if len(data) > 5000:
+                                    logger.info("Pollinations/%s ✓ %dKB (token=%s)", model, len(data)//1024, bool(params.get("token")))
+                                    return data, None
+                    except asyncio.TimeoutError:
+                        logger.warning("Pollinations/%s: таймаут", model)
+                    except Exception as e:
+                        logger.warning("Pollinations/%s: %s", model, str(e)[:80])
+                    await asyncio.sleep(0.5)
 
-                ct = resp.headers.get("Content-Type", "")
-                if "image" in ct or "octet" in ct:
-                    data = await resp.read()
-                    if len(data) > 5000:
-                        logger.info("Pollinations/%s ✓ %dKB", model, len(data)//1024)
-                        return data, None
-                    return None, f"Pollinations: ответ слишком маленький ({len(data)} байт)"
+        return None, f"Pollinations/{model}: все URL/варианты недоступны (Cloudflare 530 или ошибка)"
 
-                # Если ответ JSON
-                try:
-                    j = await resp.json(content_type=None)
-                    img_url = j.get("url") or j.get("imageUrl")
-                    if img_url:
-                        img_bytes = await _download_image_url(img_url)
-                        if img_bytes:
-                            return img_bytes, None
-                    return None, f"Pollinations: неизвестный JSON ({str(j)[:80]})"
-                except Exception:
-                    raw = await resp.text()
-                    return None, f"Pollinations: неизвестный ответ ({raw[:80]})"
-
-    except asyncio.TimeoutError:
-        logger.warning("Pollinations/%s: таймаут", model)
-        return None, f"Pollinations: таймаут ({model})"
     except Exception as e:
         logger.warning("Pollinations/%s: %s", model, str(e)[:100])
         return None, f"Pollinations: {str(e)[:80]}"
-
 
 async def generate_image_perchance_all_modes(prompt: str) -> tuple:
     """
