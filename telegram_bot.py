@@ -534,129 +534,53 @@ async def generate_image_local(prompt: str) -> tuple:
 
 async def _generate_gemini_image(prompt: str) -> tuple:
     """
-    Генерация через Gemini 2.0 Flash (multimodal image generation).
-    Модель: gemini-2.0-flash-exp — бесплатно, 500/день.
+    Бесплатная генерация через gemini-2.0-flash-exp-image-generation.
+    Эндпоинт: generateContent с responseModalities=["IMAGE"].
+    Imagen (predict) — платный, эта модель — бесплатная.
     """
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY не задан"
     import aiohttp, base64
 
-    # Пробуем несколько актуальных моделей по порядку
-    models = [
-        "gemini-2.0-flash-exp",
-        "gemini-2.0-flash-preview-image-generation",
-        "gemini-2.5-flash-preview-05-20",
-    ]
-    for model in models:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    if resp.status == 404:
-                        logger.warning("gemini [%s]: 404 (модель недоступна)", model)
-                        continue
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning("gemini [%s]: HTTP %d: %s", model, resp.status, body[:80])
-                        continue
-                    data = await resp.json()
-                    candidates = data.get("candidates", [])
-                    if not candidates:
-                        logger.warning("gemini [%s]: пустой ответ", model)
-                        continue
-                    for part in candidates[0].get("content", {}).get("parts", []):
-                        inline = part.get("inlineData") or part.get("inline_data")
-                        if inline and inline.get("data"):
-                            img_bytes = base64.b64decode(inline["data"])
-                            logger.info("gemini [%s]: ✓ %dKB", model, len(img_bytes) // 1024)
-                            return img_bytes, None
-                    logger.warning("gemini [%s]: картинка не найдена в ответе", model)
-        except asyncio.TimeoutError:
-            logger.warning("gemini [%s]: таймаут", model)
-        except Exception as e:
-            logger.warning("gemini [%s]: %s", model, str(e)[:100])
-
-    return None, "gemini: все модели не сработали"
-
-
-async def _generate_together_image(prompt: str) -> tuple:
-    """
-    Together AI — FLUX.1-schnell (~$0.0006/картинку при наличии кредитов).
-    Пробует несколько моделей по порядку.
-    """
-    if not TOGETHER_API_TOKEN:
-        return None, "TOGETHER_API_TOKEN не задан"
-    import aiohttp, base64
-
-    # Модели: сначала schnell (дешевле), потом другие
-    models = [
-        ("black-forest-labs/FLUX.1-schnell", 4),
-        ("black-forest-labs/FLUX.1-depth", 10),
-    ]
-    for model_name, steps in models:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    TOGETHER_URL,
-                    json={
-                        "model":           model_name,
-                        "prompt":          prompt,
-                        "width":           512,
-                        "height":          512,
-                        "steps":           steps,
-                        "n":               1,
-                        "response_format": "b64_json",
-                    },
-                    headers={
-                        "Authorization": f"Bearer {TOGETHER_API_TOKEN}",
-                        "Content-Type":  "application/json",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    if resp.status == 402:
-                        body = await resp.text()
-                        logger.warning("together [%s]: HTTP 402 — нет кредитов: %s", model_name, body[:60])
-                        return None, "together: нет кредитов (пополни баланс на together.ai)"
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning("together [%s]: HTTP %d: %s", model_name, resp.status, body[:60])
-                        continue
-                    data = await resp.json()
-                    items = data.get("data", [])
-                    if not items:
-                        logger.warning("together [%s]: пустой data", model_name)
-                        continue
-                    item = items[0]
-                    if item.get("b64_json"):
-                        img_bytes = base64.b64decode(item["b64_json"])
-                        logger.info("together [%s]: ✓ %dKB", model_name, len(img_bytes) // 1024)
+    # Только эта модель поддерживает генерацию картинок бесплатно
+    model = "gemini-2.0-flash-exp-image-generation"
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                body = await resp.read()
+                if resp.status != 200:
+                    return None, f"gemini: HTTP {resp.status}: {body[:120].decode(errors='replace')}"
+                import json as _json
+                data = _json.loads(body)
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    return None, f"gemini: нет candidates: {str(data)[:100]}"
+                for part in candidates[0].get("content", {}).get("parts", []):
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline and inline.get("data"):
+                        img_bytes = base64.b64decode(inline["data"])
+                        logger.info("gemini: ✓ %dKB", len(img_bytes) // 1024)
                         return img_bytes, None
-                    if item.get("url"):
-                        async with session.get(item["url"], timeout=aiohttp.ClientTimeout(total=30)) as r:
-                            if r.status == 200:
-                                img_bytes = await r.read()
-                                logger.info("together [%s]: ✓ %dKB (url)", model_name, len(img_bytes) // 1024)
-                                return img_bytes, None
-        except asyncio.TimeoutError:
-            logger.warning("together [%s]: таймаут", model_name)
-        except Exception as e:
-            logger.warning("together [%s]: %s", model_name, str(e)[:100])
-
-    return None, "together: все модели не сработали"
+                return None, f"gemini: картинка не найдена в ответе: {str(data)[:150]}"
+    except asyncio.TimeoutError:
+        return None, "gemini: таймаут"
+    except Exception as e:
+        return None, f"gemini: {str(e)[:100]}"
 
 
 async def _generate_g4f_image(prompt: str) -> tuple:
-    """g4f резервный — Airforce и ImageLabs не за CF."""
+    """g4f — резервный вариант, Airforce и ImageLabs не за CF."""
     import aiohttp
     try:
         from g4f.client import Client as G4FClient
@@ -675,6 +599,9 @@ async def _generate_g4f_image(prompt: str) -> tuple:
         p = getattr(Providers, name, None)
         if p is not None:
             attempts.append((p, model))
+
+    if not attempts:
+        return None, "g4f: нет доступных провайдеров"
 
     loop = asyncio.get_event_loop()
     for provider, model in attempts:
@@ -717,22 +644,15 @@ async def _generate_g4f_image(prompt: str) -> tuple:
 async def generate_image_g4f(prompt: str) -> tuple:
     """
     Главная функция генерации. Порядок:
-      1. Gemini 2.0 Flash — бесплатно 500/день (нет CF-блокировок)
-      2. Together AI FLUX.1-schnell — $0.0006/картинку при наличии кредитов
-      3. g4f Airforce/ImageLabs — резервный без ключей
-      4. Локальный SD — если установлен diffusers
+      1. Gemini gemini-2.0-flash-exp-image-generation — БЕСПЛАТНО, без CF
+      2. g4f Airforce/ImageLabs — резервный без ключей
+      3. Локальный SD — если установлен diffusers
     """
-    logger.info("Draw: пробуем Gemini...")
+    logger.info("Draw: пробуем Gemini (бесплатно)...")
     img, err = await _generate_gemini_image(prompt)
     if img:
         return img, None
     logger.warning("Draw: Gemini: %s", err)
-
-    logger.info("Draw: пробуем Together AI...")
-    img, err = await _generate_together_image(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: Together: %s", err)
 
     logger.info("Draw: пробуем g4f...")
     img, err = await _generate_g4f_image(prompt)
@@ -746,7 +666,7 @@ async def generate_image_g4f(prompt: str) -> tuple:
         return img, None
     logger.warning("Draw: SD: %s", err)
 
-    return None, "все методы провалились (Gemini + Together + g4f + SD)"
+    return None, "все методы провалились (Gemini + g4f + SD)"
 
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
