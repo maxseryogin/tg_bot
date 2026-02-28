@@ -532,6 +532,18 @@ async def generate_image_local(prompt: str) -> tuple:
             return None, str(e)[:100]
 
 
+def _g4f_get_provider(Providers, *names):
+    """
+    Ищет провайдер по нескольким возможным именам (API g4f меняет имена между версиями).
+    Возвращает объект провайдера или None.
+    """
+    for name in names:
+        p = getattr(Providers, name, None)
+        if p is not None:
+            return p, name
+    return None, None
+
+
 async def generate_image_g4f(prompt: str) -> tuple:
     """
     Генерация через g4f.
@@ -542,8 +554,8 @@ async def generate_image_g4f(prompt: str) -> tuple:
 
     Стратегия (порядок попыток):
       1. Blackbox (blackbox.ai) — их собственный flux/sdxl, не HF квота, бесплатно
-      2. flux без провайдера — только если Blackbox упал, тратим HF квоту бережно
-      3. sdxl без провайдера — совсем запасной вариант
+      2. DeepInfra — не HF квота
+      3. flux без провайдера — только если всё упало, тратим HF квоту бережно
     """
     import aiohttp
     try:
@@ -555,57 +567,118 @@ async def generate_image_g4f(prompt: str) -> tuple:
     loop = asyncio.get_event_loop()
 
     # ── Попытка 1: Blackbox.ai (собственный flux, без HF квоты) ──────────────
-    for bb_model in ("flux", "sdxl", "dall-e-3"):
+    # Имена провайдера менялись между версиями g4f
+    bb_provider, bb_name = _g4f_get_provider(
+        Providers, "Blackbox", "BlackboxAI", "BlackBox",
+    )
+    if bb_provider:
+        for bb_model in ("flux", "sdxl", "dall-e-3"):
+            try:
+                def _gen_bb(m=bb_model, prov=bb_provider):
+                    client = G4FClient()
+                    resp = client.images.generate(
+                        model=m,
+                        prompt=prompt,
+                        provider=prov,
+                        response_format="url",
+                    )
+                    return resp.data[0].url if resp.data else None
+
+                logger.info("g4f: %s/%s...", bb_name, bb_model)
+                img_url = await asyncio.wait_for(
+                    loop.run_in_executor(None, _gen_bb), timeout=90
+                )
+                if img_url:
+                    img_bytes = await _download_image_url(img_url)
+                    if img_bytes:
+                        logger.info("g4f: %s/%s ✓ %dKB", bb_name, bb_model, len(img_bytes)//1024)
+                        return img_bytes, None
+            except asyncio.TimeoutError:
+                logger.warning("g4f: %s/%s таймаут", bb_name, bb_model)
+            except Exception as e:
+                logger.warning("g4f: %s/%s: %s", bb_name, bb_model, str(e)[:100])
+            await asyncio.sleep(random.uniform(2, 4))
+    else:
+        logger.warning("g4f: провайдер Blackbox не найден в текущей версии g4f")
+
+    # ── Попытка 2: DeepInfra (не HF квота) ───────────────────────────────────
+    di_provider, di_name = _g4f_get_provider(
+        Providers, "DeepInfraImage", "DeepInfra", "DeepInfraProvider",
+    )
+    if di_provider:
         try:
-            def _gen_bb(m=bb_model):
+            def _gen_di(prov=di_provider):
                 client = G4FClient()
                 resp = client.images.generate(
-                    model=m,
+                    model="flux",
                     prompt=prompt,
-                    provider=Providers.Blackbox,
+                    provider=prov,
                     response_format="url",
                 )
                 return resp.data[0].url if resp.data else None
 
-            logger.info("g4f: Blackbox/%s...", bb_model)
-            img_url = await asyncio.wait_for(
-                loop.run_in_executor(None, _gen_bb), timeout=90
-            )
+            logger.info("g4f: %s/flux...", di_name)
+            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_di), timeout=90)
             if img_url:
                 img_bytes = await _download_image_url(img_url)
                 if img_bytes:
-                    logger.info("g4f: Blackbox/%s ✓ %dKB", bb_model, len(img_bytes)//1024)
+                    logger.info("g4f: %s ✓ %dKB", di_name, len(img_bytes)//1024)
                     return img_bytes, None
         except asyncio.TimeoutError:
-            logger.warning("g4f: Blackbox/%s таймаут", bb_model)
+            logger.warning("g4f: %s таймаут", di_name)
         except Exception as e:
-            logger.warning("g4f: Blackbox/%s: %s", bb_model, str(e)[:100])
+            logger.warning("g4f: %s: %s", di_name, str(e)[:100])
         await asyncio.sleep(random.uniform(2, 4))
+    else:
+        logger.warning("g4f: провайдер DeepInfra не найден в текущей версии g4f")
 
-    # ── Попытка 2: DeepInfraImage (не HF квота) ───────────────────────────────
+    # ── Попытка 2б: перебираем все доступные image-провайдеры g4f ─────────────
+    # Находим провайдеры у которых есть image_models или url содержит image
     try:
-        def _gen_di():
-            client = G4FClient()
-            resp = client.images.generate(
-                model="flux",
-                prompt=prompt,
-                provider=Providers.DeepInfraImage,
-                response_format="url",
+        import g4f.Provider as _Prov
+        tried = {bb_name, di_name, None}
+        for pname in dir(_Prov):
+            if pname.startswith("_") or pname in tried:
+                continue
+            pobj = getattr(_Prov, pname, None)
+            if pobj is None or not callable(pobj):
+                continue
+            # ищем провайдеры с image в имени или supports_image_generation
+            has_img = (
+                "image" in pname.lower() or
+                getattr(pobj, "supports_image_generation", False) or
+                bool(getattr(pobj, "image_models", None))
             )
-            return resp.data[0].url if resp.data else None
+            if not has_img:
+                continue
+            tried.add(pname)
+            try:
+                def _gen_auto(prov=pobj, pn=pname):
+                    client = G4FClient()
+                    resp = client.images.generate(
+                        model="flux",
+                        prompt=prompt,
+                        provider=prov,
+                        response_format="url",
+                    )
+                    return resp.data[0].url if resp.data else None
 
-        logger.info("g4f: DeepInfraImage/flux...")
-        img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_di), timeout=90)
-        if img_url:
-            img_bytes = await _download_image_url(img_url)
-            if img_bytes:
-                logger.info("g4f: DeepInfraImage ✓ %dKB", len(img_bytes)//1024)
-                return img_bytes, None
-    except asyncio.TimeoutError:
-        logger.warning("g4f: DeepInfraImage таймаут")
+                logger.info("g4f: авто-провайдер %s...", pname)
+                img_url = await asyncio.wait_for(
+                    loop.run_in_executor(None, _gen_auto), timeout=60
+                )
+                if img_url:
+                    img_bytes = await _download_image_url(img_url)
+                    if img_bytes:
+                        logger.info("g4f: %s ✓ %dKB", pname, len(img_bytes)//1024)
+                        return img_bytes, None
+            except asyncio.TimeoutError:
+                logger.warning("g4f: %s таймаут", pname)
+            except Exception as e:
+                logger.warning("g4f: %s: %s", pname, str(e)[:80])
+            await asyncio.sleep(random.uniform(1, 3))
     except Exception as e:
-        logger.warning("g4f: DeepInfraImage: %s", str(e)[:100])
-    await asyncio.sleep(random.uniform(2, 4))
+        logger.warning("g4f: авто-перебор упал: %s", e)
 
     # ── Попытка 3: flux автовыбор (HF квота — используем бережно) ────────────
     # Трекаем сколько раз сегодня уже тратили HF квоту
@@ -681,6 +754,70 @@ async def _download_image_url(url: str) -> bytes | None:
 # Olike-AI — Perchance-hosted AI art generator (https://perchance.org/olike-ai)
 # Поддерживает три режима: pollen (качество), buzz (скорость), fresh (стиль)
 _PERCHANCE_MODES = ["pollen", "buzz", "fresh"]
+_PERCHANCE_USER_KEY: str = ""
+_PERCHANCE_KEY_TS:   float = 0.0
+_PERCHANCE_KEY_TTL:  float = 3600.0   # ключ живёт ~1 час
+
+
+async def _perchance_get_user_key(session) -> str:
+    """
+    Получает временный userKey у Perchance (нужен для API-запросов).
+    Ключ кэшируется на 1 час.
+    """
+    import aiohttp, re as _re
+    global _PERCHANCE_USER_KEY, _PERCHANCE_KEY_TS
+
+    now = time.time()
+    if _PERCHANCE_USER_KEY and (now - _PERCHANCE_KEY_TS) < _PERCHANCE_KEY_TTL:
+        return _PERCHANCE_USER_KEY
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer":    "https://perchance.org/",
+    }
+
+    # Шаг 1: получаем временный ключ через специальный эндпоинт Perchance
+    key_url = "https://image-generation.perchance.org/api/getTemporaryUserKey"
+    try:
+        async with session.get(
+            key_url,
+            params={"adAccessCode": "allow"},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                key  = data.get("userKey") or data.get("key") or ""
+                if key:
+                    _PERCHANCE_USER_KEY = key
+                    _PERCHANCE_KEY_TS   = now
+                    logger.info("Perchance: получен userKey (len=%d)", len(key))
+                    return key
+                logger.warning("Perchance: getTemporaryUserKey вернул: %s", str(data)[:120])
+    except Exception as e:
+        logger.warning("Perchance: ошибка получения ключа: %s", str(e)[:80])
+
+    # Шаг 2: fallback — парсим JS-страницу olike-ai
+    try:
+        async with session.get(
+            "https://perchance.org/olike-ai",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            if r.status == 200:
+                text = await r.text()
+                m = _re.search(r'userKey\s*[=:]\s*["\']([a-zA-Z0-9_\-]{10,})["\']', text)
+                if m:
+                    _PERCHANCE_USER_KEY = m.group(1)
+                    _PERCHANCE_KEY_TS   = now
+                    logger.info("Perchance: userKey из JS (len=%d)", len(_PERCHANCE_USER_KEY))
+                    return _PERCHANCE_USER_KEY
+    except Exception as e:
+        logger.warning("Perchance: парсинг страницы упал: %s", str(e)[:80])
+
+    return ""
+
 
 async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
     """
@@ -688,44 +825,48 @@ async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
     mode: 'pollen' | 'buzz' | 'fresh'
     Возвращает (bytes, None) при успехе или (None, error_str) при ошибке.
     """
-    import aiohttp, urllib.parse
+    import aiohttp
 
     if mode not in _PERCHANCE_MODES:
         mode = "pollen"
 
-    # olike-ai использует Perchance API для генерации
-    # Базовый URL API Perchance для AI-генерации
-    base_url = "https://image-generation.perchance.org/api/generate"
-
-    params = {
-        "prompt":       prompt,
-        "negativePrompt": "ugly, blurry, deformed, watermark, text, nsfw, lowres",
-        "resolution":   "512x512",
-        "guidanceScale": "7",
-        "seed":         str(random.randint(1, 2**31)),
-        "__metadata__": f"olike-ai-{mode}",
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer":    "https://perchance.org/olike-ai",
+        "Origin":     "https://perchance.org",
     }
 
-    # Подбираем channel (стиль) по режиму
     _mode_channels = {
         "pollen": "olike-pollen",
         "buzz":   "olike-buzz",
         "fresh":  "olike-fresh",
     }
-    params["channel"] = _mode_channels.get(mode, "olike-pollen")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer":    "https://perchance.org/olike-ai",
-        "Origin":     "https://perchance.org",
-    }
+    channel = _mode_channels.get(mode, "olike-pollen")
 
     try:
         async with aiohttp.ClientSession() as session:
+            # Получаем userKey
+            user_key = await _perchance_get_user_key(session)
+            if not user_key:
+                return None, "Perchance: не удалось получить userKey"
+
+            params = {
+                "prompt":           prompt,
+                "negativePrompt":   "ugly, blurry, deformed, watermark, text, nsfw, lowres",
+                "resolution":       "512x512",
+                "guidanceScale":    "7",
+                "seed":             str(random.randint(1, 2**31)),
+                "channel":          channel,
+                "userKey":          user_key,
+                "__metadata__":     f"olike-ai-{mode}",
+            }
+
             logger.info("Perchance/olike-%s: генерируем...", mode)
             async with session.get(
-                base_url, params=params, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=90),
+                "https://image-generation.perchance.org/api/generate",
+                params=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status != 200:
                     logger.warning("Perchance HTTP %d", resp.status)
@@ -739,21 +880,28 @@ async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
                         return data, None
                     return None, "Perchance: слишком маленький ответ"
 
-                # JSON ответ с URL или base64
+                # JSON ответ
                 try:
                     j = await resp.json(content_type=None)
                 except Exception:
-                    text_resp = await resp.text()
-                    # попробуем найти base64 внутри
-                    if "base64" in text_resp or text_resp.startswith("data:"):
-                        img = await _download_image_url(text_resp.strip())
+                    raw = await resp.text()
+                    if raw.startswith("data:image"):
+                        img = await _download_image_url(raw.strip())
                         if img:
                             return img, None
-                    return None, f"Perchance: неожиданный ответ ({text_resp[:80]})"
+                    return None, f"Perchance: неожиданный ответ ({raw[:80]})"
+
+                status = j.get("status", "")
+                # invalid_key — сбрасываем кэш ключа чтобы получить свежий
+                if status == "invalid_key":
+                    global _PERCHANCE_USER_KEY, _PERCHANCE_KEY_TS
+                    _PERCHANCE_USER_KEY = ""
+                    _PERCHANCE_KEY_TS   = 0.0
+                    return None, "Perchance: invalid_key (ключ сброшен, попробуй снова)"
 
                 img_url = (
                     j.get("imageUrl") or j.get("url") or j.get("image") or
-                    j.get("data", {}).get("url") if isinstance(j.get("data"), dict) else None
+                    (j.get("data", {}).get("url") if isinstance(j.get("data"), dict) else None)
                 )
                 if img_url:
                     img_bytes = await _download_image_url(img_url)
