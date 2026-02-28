@@ -78,8 +78,9 @@ PLAYER_URL          = _config("PLAYER_URL", "http://localhost:9988")
 TOGETHER_API_TOKEN  = _config("TOGETHER_API_TOKEN", "")
 GEMINI_API_KEY      = _config("GEMINI_API_KEY", "")
 REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
-MUKESH_API_KEY      = _config("MUKESH_API_KEY", "")
-TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
+MUKESH_API_KEY        = _config("MUKESH_API_KEY", "")
+PERCHANCE_USER_KEY    = _config("PERCHANCE_USER_KEY", "")
+TOGETHER_URL          = "https://api.together.xyz/v1/images/generations"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -749,187 +750,123 @@ async def _download_image_url(url: str) -> bytes | None:
         logger.warning("_download_image_url: %s", str(e)[:80])
     return None
 
-# ── Генерация через Perchance / Olike-AI ─────────────────────────────────────
+# ── Генерация через Pollinations.ai (olike использует его бэкенд) ─────────────
 
-# Olike-AI — Perchance-hosted AI art generator (https://perchance.org/olike-ai)
-# Поддерживает три режима: pollen (качество), buzz (скорость), fresh (стиль)
+# olike на perchance.org использует Pollinations.ai как бэкенд.
+# Ключ из PERCHANCE_USER_KEY (формат sk_...) является токеном Pollinations.ai.
+# API: GET https://image.pollinations.ai/prompt/{prompt}?model=...&token=...
+# Док: https://image.pollinations.ai
+
+_POLLINATIONS_MODELS = [
+    "flux",          # основная модель (pollen)
+    "flux-realism",  # реализм (buzz)
+    "flux-anime",    # аниме (fresh)
+    "turbo",         # быстрый фоллбэк
+]
+
+# Соответствие режимов olike моделям Pollinations
+_OLIKE_MODE_MODELS = {
+    "pollen": "flux",
+    "buzz":   "flux-realism",
+    "fresh":  "flux-anime",
+}
 _PERCHANCE_MODES = ["pollen", "buzz", "fresh"]
-_PERCHANCE_USER_KEY: str = ""
-_PERCHANCE_KEY_TS:   float = 0.0
-_PERCHANCE_KEY_TTL:  float = 3600.0   # ключ живёт ~1 час
-
-
-async def _perchance_get_user_key(session) -> str:
-    """
-    Получает временный userKey у Perchance (нужен для API-запросов).
-    Ключ кэшируется на 1 час.
-    """
-    import aiohttp, re as _re
-    global _PERCHANCE_USER_KEY, _PERCHANCE_KEY_TS
-
-    now = time.time()
-    if _PERCHANCE_USER_KEY and (now - _PERCHANCE_KEY_TS) < _PERCHANCE_KEY_TTL:
-        return _PERCHANCE_USER_KEY
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Referer":    "https://perchance.org/",
-    }
-
-    # Шаг 1: получаем временный ключ через специальный эндпоинт Perchance
-    key_url = "https://image-generation.perchance.org/api/getTemporaryUserKey"
-    try:
-        async with session.get(
-            key_url,
-            params={"adAccessCode": "allow"},
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            if r.status == 200:
-                data = await r.json(content_type=None)
-                key  = data.get("userKey") or data.get("key") or ""
-                if key:
-                    _PERCHANCE_USER_KEY = key
-                    _PERCHANCE_KEY_TS   = now
-                    logger.info("Perchance: получен userKey (len=%d)", len(key))
-                    return key
-                logger.warning("Perchance: getTemporaryUserKey вернул: %s", str(data)[:120])
-    except Exception as e:
-        logger.warning("Perchance: ошибка получения ключа: %s", str(e)[:80])
-
-    # Шаг 2: fallback — парсим JS-страницу olike-ai
-    try:
-        async with session.get(
-            "https://perchance.org/olike-ai",
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            if r.status == 200:
-                text = await r.text()
-                m = _re.search(r'userKey\s*[=:]\s*["\']([a-zA-Z0-9_\-]{10,})["\']', text)
-                if m:
-                    _PERCHANCE_USER_KEY = m.group(1)
-                    _PERCHANCE_KEY_TS   = now
-                    logger.info("Perchance: userKey из JS (len=%d)", len(_PERCHANCE_USER_KEY))
-                    return _PERCHANCE_USER_KEY
-    except Exception as e:
-        logger.warning("Perchance: парсинг страницы упал: %s", str(e)[:80])
-
-    return ""
 
 
 async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
     """
-    Генерация картинки через Perchance olike-ai.
-    mode: 'pollen' | 'buzz' | 'fresh'
-    Возвращает (bytes, None) при успехе или (None, error_str) при ошибке.
+    Генерация через Pollinations.ai (бэкенд olike на perchance.org).
+    mode: 'pollen' (flux) | 'buzz' (flux-realism) | 'fresh' (flux-anime)
+    Ключ читается из PERCHANCE_USER_KEY (токен Pollinations.ai в формате sk_...).
     """
-    import aiohttp
+    import aiohttp, urllib.parse
 
     if mode not in _PERCHANCE_MODES:
         mode = "pollen"
 
+    model = _OLIKE_MODE_MODELS.get(mode, "flux")
+
+    # Pollinations.ai API: GET /prompt/{encoded_prompt}
+    encoded = urllib.parse.quote(prompt, safe="")
+    url = f"https://image.pollinations.ai/prompt/{encoded}"
+
+    params = {
+        "model":    model,
+        "width":    "1024",
+        "height":   "1024",
+        "seed":     str(random.randint(1, 2**31)),
+        "nologo":   "true",
+        "enhance":  "false",
+        "private":  "true",
+    }
+
+    # Добавляем токен если есть
+    token = PERCHANCE_USER_KEY.strip()
+    if token:
+        params["token"] = token
+        logger.info("Pollinations: используем токен (len=%d), модель=%s", len(token), model)
+    else:
+        logger.info("Pollinations: без токена, модель=%s", model)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Referer":    "https://perchance.org/olike-ai",
+        "Referer":    "https://perchance.org/olike",
         "Origin":     "https://perchance.org",
     }
 
-    _mode_channels = {
-        "pollen": "olike-pollen",
-        "buzz":   "olike-buzz",
-        "fresh":  "olike-fresh",
-    }
-    channel = _mode_channels.get(mode, "olike-pollen")
-
     try:
         async with aiohttp.ClientSession() as session:
-            # Получаем userKey
-            user_key = await _perchance_get_user_key(session)
-            if not user_key:
-                return None, "Perchance: не удалось получить userKey"
-
-            params = {
-                "prompt":           prompt,
-                "negativePrompt":   "ugly, blurry, deformed, watermark, text, nsfw, lowres",
-                "resolution":       "512x512",
-                "guidanceScale":    "7",
-                "seed":             str(random.randint(1, 2**31)),
-                "channel":          channel,
-                "userKey":          user_key,
-                "__metadata__":     f"olike-ai-{mode}",
-            }
-
-            logger.info("Perchance/olike-%s: генерируем...", mode)
             async with session.get(
-                "https://image-generation.perchance.org/api/generate",
-                params=params, headers=headers,
+                url, params=params, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
+                allow_redirects=True,
             ) as resp:
-                if resp.status != 200:
-                    logger.warning("Perchance HTTP %d", resp.status)
-                    return None, f"Perchance HTTP {resp.status}"
+                if resp.status not in (200, 201):
+                    logger.warning("Pollinations/%s HTTP %d", model, resp.status)
+                    return None, f"Pollinations HTTP {resp.status}"
 
                 ct = resp.headers.get("Content-Type", "")
-                if "image" in ct:
+                if "image" in ct or "octet" in ct:
                     data = await resp.read()
-                    if len(data) > 2000:
-                        logger.info("Perchance/olike-%s ✓ %dKB", mode, len(data)//1024)
+                    if len(data) > 5000:
+                        logger.info("Pollinations/%s ✓ %dKB", model, len(data)//1024)
                         return data, None
-                    return None, "Perchance: слишком маленький ответ"
+                    return None, f"Pollinations: ответ слишком маленький ({len(data)} байт)"
 
-                # JSON ответ
+                # Если ответ JSON
                 try:
                     j = await resp.json(content_type=None)
+                    img_url = j.get("url") or j.get("imageUrl")
+                    if img_url:
+                        img_bytes = await _download_image_url(img_url)
+                        if img_bytes:
+                            return img_bytes, None
+                    return None, f"Pollinations: неизвестный JSON ({str(j)[:80]})"
                 except Exception:
                     raw = await resp.text()
-                    if raw.startswith("data:image"):
-                        img = await _download_image_url(raw.strip())
-                        if img:
-                            return img, None
-                    return None, f"Perchance: неожиданный ответ ({raw[:80]})"
-
-                status = j.get("status", "")
-                # invalid_key — сбрасываем кэш ключа чтобы получить свежий
-                if status == "invalid_key":
-                    global _PERCHANCE_USER_KEY, _PERCHANCE_KEY_TS
-                    _PERCHANCE_USER_KEY = ""
-                    _PERCHANCE_KEY_TS   = 0.0
-                    return None, "Perchance: invalid_key (ключ сброшен, попробуй снова)"
-
-                img_url = (
-                    j.get("imageUrl") or j.get("url") or j.get("image") or
-                    (j.get("data", {}).get("url") if isinstance(j.get("data"), dict) else None)
-                )
-                if img_url:
-                    img_bytes = await _download_image_url(img_url)
-                    if img_bytes:
-                        logger.info("Perchance/olike-%s (URL) ✓ %dKB", mode, len(img_bytes)//1024)
-                        return img_bytes, None
-                return None, f"Perchance: нет URL в ответе ({str(j)[:120]})"
+                    return None, f"Pollinations: неизвестный ответ ({raw[:80]})"
 
     except asyncio.TimeoutError:
-        logger.warning("Perchance/olike-%s: таймаут", mode)
-        return None, "Perchance: таймаут"
+        logger.warning("Pollinations/%s: таймаут", model)
+        return None, f"Pollinations: таймаут ({model})"
     except Exception as e:
-        logger.warning("Perchance/olike-%s: %s", mode, str(e)[:100])
-        return None, f"Perchance: {str(e)[:80]}"
+        logger.warning("Pollinations/%s: %s", model, str(e)[:100])
+        return None, f"Pollinations: {str(e)[:80]}"
 
 
 async def generate_image_perchance_all_modes(prompt: str) -> tuple:
     """
-    Пробует все три режима Perchance (pollen → buzz → fresh).
+    Перебирает все режимы: pollen (flux) → buzz (flux-realism) → fresh (flux-anime).
     Возвращает первый успешный результат.
     """
     for mode in _PERCHANCE_MODES:
         img_bytes, err = await generate_image_perchance(prompt, mode)
         if img_bytes:
             return img_bytes, None
-        logger.warning("Perchance/%s не сработал: %s", mode, err)
-        await asyncio.sleep(random.uniform(2, 4))
-    return None, "Perchance: все режимы (pollen/buzz/fresh) недоступны"
+        logger.warning("Pollinations/%s не сработал: %s", mode, err)
+        await asyncio.sleep(random.uniform(1, 3))
+    return None, "Pollinations: все модели недоступны"
 
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
