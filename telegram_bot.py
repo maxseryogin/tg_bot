@@ -78,9 +78,8 @@ PLAYER_URL          = _config("PLAYER_URL", "http://localhost:9988")
 TOGETHER_API_TOKEN  = _config("TOGETHER_API_TOKEN", "")
 GEMINI_API_KEY      = _config("GEMINI_API_KEY", "")
 REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
-MUKESH_API_KEY        = _config("MUKESH_API_KEY", "")
-PERCHANCE_USER_KEY    = _config("PERCHANCE_USER_KEY", "")
-TOGETHER_URL          = "https://api.together.xyz/v1/images/generations"
+MUKESH_API_KEY      = _config("MUKESH_API_KEY", "")
+TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -439,13 +438,101 @@ HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 
 # ── Очередь картинок на чат (1 генерация + 40 сек между) ─────────────────────
 DRAW_TRIGGER      = "жужа нарисуй"
-DRAW_COOLDOWN_SEC = 90          # 90 сек между генерациями — беречь HF квоту (75сGPU/сутки)
-_draw_cooldowns: dict[int, float] = {}  # переопределяем: теперь это per-chat
+DRAW_COOLDOWN_SEC = 90
+_draw_cooldowns: dict[int, float] = {}
 
-# Очереди: chat_id → asyncio.Queue с элементами (message, prompt_raw, prompt_en)
 _draw_queues:     dict[int, asyncio.Queue]  = {}
 _draw_queue_busy: dict[int, bool]           = {}
-_draw_last_done:  dict[int, float]          = {}   # время завершения последней генерации
+_draw_last_done:  dict[int, float]          = {}
+
+
+# ── Cobalt: кэш доступных инстансов ──────────────────────────────────────────
+
+# Все известные инстансы
+_COBALT_ALL_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt.imput.net",
+    "https://cbl.henhen1227.com",
+    "https://cobalt.tools",
+]
+
+# Кэш: instance_url → (is_alive: bool, checked_at: float)
+# Мёртвые инстансы не опрашиваются 10 минут
+_cobalt_instance_cache: dict[str, tuple[bool, float]] = {}
+_COBALT_DEAD_TTL = 600   # 10 минут не трогаем мёртвый инстанс
+_COBALT_CHECK_TIMEOUT = 5  # секунд на проверку доступности
+
+
+async def _cobalt_get_live_instances() -> list[str]:
+    """
+    Возвращает только живые инстансы cobalt.
+    Мёртвые пропускаем на _COBALT_DEAD_TTL секунд без повторной проверки.
+    """
+    import aiohttp
+    now = time.time()
+    live = []
+    to_check = []
+
+    for inst in _COBALT_ALL_INSTANCES:
+        cached = _cobalt_instance_cache.get(inst)
+        if cached:
+            is_alive, checked_at = cached
+            age = now - checked_at
+            if is_alive:
+                live.append(inst)
+                continue
+            elif age < _COBALT_DEAD_TTL:
+                # Мёртвый и кэш ещё свежий — пропускаем
+                logger.debug("cobalt: пропускаем мёртвый инстанс %s (кэш %ds)", inst, int(age))
+                continue
+        # Нет кэша или кэш устарел — нужно проверить
+        to_check.append(inst)
+
+    if to_check:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        }
+
+        async def _check(inst: str):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        inst,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=_COBALT_CHECK_TIMEOUT),
+                        allow_redirects=False,
+                    ) as resp:
+                        # Любой HTTP-ответ = инстанс жив (даже 405)
+                        alive = resp.status not in (502, 503, 504, 0)
+                        _cobalt_instance_cache[inst] = (alive, time.time())
+                        if alive:
+                            logger.info("cobalt: ✓ %s (HTTP %d)", inst, resp.status)
+                        else:
+                            logger.info("cobalt: ✗ %s (HTTP %d)", inst, resp.status)
+                        return alive
+            except Exception as e:
+                err = str(e)[:60]
+                # DNS/connect ошибки = точно мёртв
+                _cobalt_instance_cache[inst] = (False, time.time())
+                logger.info("cobalt: ✗ %s (%s)", inst, err)
+                return False
+
+        results = await asyncio.gather(*[_check(inst) for inst in to_check])
+        for inst, alive in zip(to_check, results):
+            if alive:
+                live.append(inst)
+
+    # Убираем дубли, сохраняя порядок
+    seen = set()
+    unique_live = []
+    for inst in live:
+        if inst not in seen:
+            seen.add(inst)
+            unique_live.append(inst)
+
+    return unique_live
 
 
 # ── Генерация изображений ─────────────────────────────────────────────────────
@@ -533,31 +620,7 @@ async def generate_image_local(prompt: str) -> tuple:
             return None, str(e)[:100]
 
 
-def _g4f_get_provider(Providers, *names):
-    """
-    Ищет провайдер по нескольким возможным именам (API g4f меняет имена между версиями).
-    Возвращает объект провайдера или None.
-    """
-    for name in names:
-        p = getattr(Providers, name, None)
-        if p is not None:
-            return p, name
-    return None, None
-
-
 async def generate_image_g4f(prompt: str) -> tuple:
-    """
-    Генерация через g4f.
-
-    Почему квота кончается:
-      flux без провайдера = HuggingFace Inference API = 75 сек GPU/сутки.
-      Каждая генерация ~15 сек GPU => максимум ~5 картинок в сутки через этот путь.
-
-    Стратегия (порядок попыток):
-      1. Blackbox (blackbox.ai) — их собственный flux/sdxl, не HF квота, бесплатно
-      2. DeepInfra — не HF квота
-      3. flux без провайдера — только если всё упало, тратим HF квоту бережно
-    """
     import aiohttp
     try:
         from g4f.client import Client as G4FClient
@@ -567,128 +630,57 @@ async def generate_image_g4f(prompt: str) -> tuple:
 
     loop = asyncio.get_event_loop()
 
-    # ── Попытка 1: Blackbox.ai (собственный flux, без HF квоты) ──────────────
-    # Имена провайдера менялись между версиями g4f
-    bb_provider, bb_name = _g4f_get_provider(
-        Providers, "Blackbox", "BlackboxAI", "BlackBox",
-    )
-    if bb_provider:
-        for bb_model in ("flux", "sdxl", "dall-e-3"):
-            try:
-                def _gen_bb(m=bb_model, prov=bb_provider):
-                    client = G4FClient()
-                    resp = client.images.generate(
-                        model=m,
-                        prompt=prompt,
-                        provider=prov,
-                        response_format="url",
-                    )
-                    return resp.data[0].url if resp.data else None
-
-                logger.info("g4f: %s/%s...", bb_name, bb_model)
-                img_url = await asyncio.wait_for(
-                    loop.run_in_executor(None, _gen_bb), timeout=90
+    for bb_model in ("flux", "sdxl", "dall-e-3"):
+        try:
+            def _gen_bb(m=bb_model):
+                client = G4FClient()
+                resp = client.images.generate(
+                    model=m,
+                    prompt=prompt,
+                    provider=Providers.Blackbox,
+                    response_format="url",
                 )
-                if img_url:
-                    img_bytes = await _download_image_url(img_url)
-                    if img_bytes:
-                        logger.info("g4f: %s/%s ✓ %dKB", bb_name, bb_model, len(img_bytes)//1024)
-                        return img_bytes, None
-            except asyncio.TimeoutError:
-                logger.warning("g4f: %s/%s таймаут", bb_name, bb_model)
-            except Exception as e:
-                logger.warning("g4f: %s/%s: %s", bb_name, bb_model, str(e)[:100])
-            await asyncio.sleep(random.uniform(2, 4))
-    else:
-        logger.warning("g4f: провайдер Blackbox не найден в текущей версии g4f")
+                return resp.data[0].url if resp.data else None
 
-    # ── Попытка 2: DeepInfra (не HF квота) ───────────────────────────────────
-    di_provider, di_name = _g4f_get_provider(
-        Providers, "DeepInfraImage", "DeepInfra", "DeepInfraProvider",
-    )
-    if di_provider:
-        di_models = [
-            "black-forest-labs/FLUX-1-schnell",
-            "black-forest-labs/FLUX-1-dev",
-            "stabilityai/stable-diffusion-xl-base-1.0",
-        ]
-        for di_model in di_models:
-            try:
-                def _gen_di(prov=di_provider, m=di_model):
-                    client = G4FClient()
-                    resp = client.images.generate(
-                        model=m,
-                        prompt=prompt,
-                        provider=prov,
-                        response_format="url",
-                    )
-                    return resp.data[0].url if resp.data else None
-
-                logger.info("g4f: %s/%s...", di_name, di_model)
-                img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_di), timeout=90)
-                if img_url:
-                    img_bytes = await _download_image_url(img_url)
-                    if img_bytes:
-                        logger.info("g4f: %s/%s ✓ %dKB", di_name, di_model, len(img_bytes)//1024)
-                        return img_bytes, None
-            except asyncio.TimeoutError:
-                logger.warning("g4f: %s/%s таймаут", di_name, di_model)
-            except Exception as e:
-                logger.warning("g4f: %s/%s: %s", di_name, di_model, str(e)[:100])
-            await asyncio.sleep(random.uniform(1, 3))
-    else:
-        logger.warning("g4f: провайдер DeepInfra не найден в текущей версии g4f")
-
-    # ── Попытка 2б: перебираем все доступные image-провайдеры g4f ─────────────
-    # Находим провайдеры у которых есть image_models или url содержит image
-    try:
-        import g4f.Provider as _Prov
-        tried = {bb_name, di_name, None}
-        for pname in dir(_Prov):
-            if pname.startswith("_") or pname in tried:
-                continue
-            pobj = getattr(_Prov, pname, None)
-            if pobj is None or not callable(pobj):
-                continue
-            # ищем провайдеры с image в имени или supports_image_generation
-            has_img = (
-                "image" in pname.lower() or
-                getattr(pobj, "supports_image_generation", False) or
-                bool(getattr(pobj, "image_models", None))
+            logger.info("g4f: Blackbox/%s...", bb_model)
+            img_url = await asyncio.wait_for(
+                loop.run_in_executor(None, _gen_bb), timeout=90
             )
-            if not has_img:
-                continue
-            tried.add(pname)
-            try:
-                def _gen_auto(prov=pobj, pn=pname):
-                    client = G4FClient()
-                    resp = client.images.generate(
-                        model="flux",
-                        prompt=prompt,
-                        provider=prov,
-                        response_format="url",
-                    )
-                    return resp.data[0].url if resp.data else None
+            if img_url:
+                img_bytes = await _download_image_url(img_url)
+                if img_bytes:
+                    logger.info("g4f: Blackbox/%s ✓ %dKB", bb_model, len(img_bytes)//1024)
+                    return img_bytes, None
+        except asyncio.TimeoutError:
+            logger.warning("g4f: Blackbox/%s таймаут", bb_model)
+        except Exception as e:
+            logger.warning("g4f: Blackbox/%s: %s", bb_model, str(e)[:100])
+        await asyncio.sleep(random.uniform(2, 4))
 
-                logger.info("g4f: авто-провайдер %s...", pname)
-                img_url = await asyncio.wait_for(
-                    loop.run_in_executor(None, _gen_auto), timeout=60
-                )
-                if img_url:
-                    img_bytes = await _download_image_url(img_url)
-                    if img_bytes:
-                        logger.info("g4f: %s ✓ %dKB", pname, len(img_bytes)//1024)
-                        return img_bytes, None
-            except asyncio.TimeoutError:
-                logger.warning("g4f: %s таймаут", pname)
-            except Exception as e:
-                logger.warning("g4f: %s: %s", pname, str(e)[:80])
-            await asyncio.sleep(random.uniform(1, 3))
+    try:
+        def _gen_di():
+            client = G4FClient()
+            resp = client.images.generate(
+                model="flux",
+                prompt=prompt,
+                provider=Providers.DeepInfraImage,
+                response_format="url",
+            )
+            return resp.data[0].url if resp.data else None
+
+        logger.info("g4f: DeepInfraImage/flux...")
+        img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_di), timeout=90)
+        if img_url:
+            img_bytes = await _download_image_url(img_url)
+            if img_bytes:
+                logger.info("g4f: DeepInfraImage ✓ %dKB", len(img_bytes)//1024)
+                return img_bytes, None
+    except asyncio.TimeoutError:
+        logger.warning("g4f: DeepInfraImage таймаут")
     except Exception as e:
-        logger.warning("g4f: авто-перебор упал: %s", e)
+        logger.warning("g4f: DeepInfraImage: %s", str(e)[:100])
+    await asyncio.sleep(random.uniform(2, 4))
 
-    # ── Попытка 3: flux автовыбор (HF квота — используем бережно) ────────────
-    # Трекаем сколько раз сегодня уже тратили HF квоту
     today = time.strftime("%Y-%m-%d")
     hf_key = f"hf_quota_{today}"
     hf_used = getattr(generate_image_g4f, "_hf_counter", {})
@@ -720,7 +712,7 @@ async def generate_image_g4f(prompt: str) -> tuple:
             err = str(e)[:120]
             logger.warning("g4f: HF/%s: %s", model, err)
             if "quota" in err.lower() or "exceeded" in err.lower():
-                hf_used[hf_key] = 99  # помечаем как исчерпанную
+                hf_used[hf_key] = 99
                 logger.warning("g4f: HF квота исчерпана, блокируем до завтра")
                 return None, "HF квота исчерпана. Попробуй завтра."
         await asyncio.sleep(random.uniform(3, 6))
@@ -729,11 +721,9 @@ async def generate_image_g4f(prompt: str) -> tuple:
 
 
 async def _download_image_url(url: str) -> bytes | None:
-    """Скачивает картинку по URL или декодирует base64 data URI."""
     import aiohttp
     if not url:
         return None
-    # base64 data URI
     if url.startswith("data:image"):
         try:
             _, b64 = url.split(",", 1)
@@ -741,7 +731,6 @@ async def _download_image_url(url: str) -> bytes | None:
             return data if len(data) > 1000 else None
         except Exception:
             return None
-    # обычный URL
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -756,149 +745,23 @@ async def _download_image_url(url: str) -> bytes | None:
         logger.warning("_download_image_url: %s", str(e)[:80])
     return None
 
-# ── Генерация через Pollinations.ai (olike использует его бэкенд) ─────────────
-
-# olike на perchance.org использует Pollinations.ai как бэкенд.
-# Ключ из PERCHANCE_USER_KEY (формат sk_...) является токеном Pollinations.ai.
-# API: GET https://image.pollinations.ai/prompt/{prompt}?model=...&token=...
-# Док: https://image.pollinations.ai
-
-_POLLINATIONS_MODELS = [
-    "flux",          # основная модель (pollen)
-    "flux-realism",  # реализм (buzz)
-    "flux-anime",    # аниме (fresh)
-    "turbo",         # быстрый фоллбэк
-]
-
-# Соответствие режимов olike моделям Pollinations
-_OLIKE_MODE_MODELS = {
-    "pollen": "flux",
-    "buzz":   "flux-realism",
-    "fresh":  "flux-anime",
-}
-_PERCHANCE_MODES = ["pollen", "buzz", "fresh"]
-
-
-async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
-    """
-    Генерация через Pollinations.ai.
-    530 = Cloudflare блокирует Railway IP => пробуем разные эндпоинты и без токена.
-    """
-    import aiohttp, urllib.parse
-
-    if mode not in _PERCHANCE_MODES:
-        mode = "pollen"
-
-    model = _OLIKE_MODE_MODELS.get(mode, "flux")
-    encoded = urllib.parse.quote(prompt, safe="")
-    token = PERCHANCE_USER_KEY.strip()
-
-    # Разные эндпоинты Pollinations.
-    # 530 = Cloudflare заблокировал Railway IP => пробуем разные варианты
-    base_urls = [
-        f"https://image.pollinations.ai/prompt/{encoded}",
-        # Альтернативный эндпоинт (gen.pollinations.ai — видели в DevTools)
-        f"https://gen.pollinations.ai/prompt/{encoded}",
-    ]
-
-    base_params = {
-        "model":   model,
-        "width":   "1024",
-        "height":  "1024",
-        "seed":    str(random.randint(1, 2**31)),
-        "nologo":  "true",
-        "private": "true",
-    }
-    if token:
-        base_params["token"] = token
-
-    # Варианты запросов: с токеном / без
-    param_variants = [base_params.copy()]
-    if token:
-        no_token = base_params.copy()
-        del no_token["token"]
-        param_variants.append(no_token)
-
-    headers_variants = [
-        # Как от perchance.org (olike)
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Referer":    "https://perchance.org/olike",
-            "Origin":     "https://perchance.org",
-        },
-        # Как от обычного браузера
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        },
-    ]
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            for url in base_urls:
-              for params in param_variants:
-                for hdrs in headers_variants:
-                    try:
-                        logger.info("Pollinations/%s: %s token=%s referer=%s",
-                                    model, url.split("/")[2],
-                                    bool(params.get("token")),
-                                    hdrs.get("Referer", "-"))
-                        async with session.get(
-                            url, params=params, headers=hdrs,
-                            timeout=aiohttp.ClientTimeout(total=120),
-                            allow_redirects=True,
-                        ) as resp:
-                            if resp.status == 530:
-                                logger.warning("Pollinations/%s: 530 Cloudflare (Railway IP заблокирован)", model)
-                                continue
-                            if resp.status not in (200, 201):
-                                logger.warning("Pollinations/%s HTTP %d", model, resp.status)
-                                continue
-                            ct = resp.headers.get("Content-Type", "")
-                            if "image" in ct or "octet" in ct:
-                                data = await resp.read()
-                                if len(data) > 5000:
-                                    logger.info("Pollinations/%s ✓ %dKB (token=%s)", model, len(data)//1024, bool(params.get("token")))
-                                    return data, None
-                    except asyncio.TimeoutError:
-                        logger.warning("Pollinations/%s: таймаут", model)
-                    except Exception as e:
-                        logger.warning("Pollinations/%s: %s", model, str(e)[:80])
-                    await asyncio.sleep(0.5)
-
-        return None, f"Pollinations/{model}: все URL/варианты недоступны (Cloudflare 530 или ошибка)"
-
-    except Exception as e:
-        logger.warning("Pollinations/%s: %s", model, str(e)[:100])
-        return None, f"Pollinations: {str(e)[:80]}"
-
-async def generate_image_perchance_all_modes(prompt: str) -> tuple:
-    """
-    Перебирает все режимы: pollen (flux) → buzz (flux-realism) → fresh (flux-anime).
-    Возвращает первый успешный результат.
-    """
-    for mode in _PERCHANCE_MODES:
-        img_bytes, err = await generate_image_perchance(prompt, mode)
-        if img_bytes:
-            return img_bytes, None
-        logger.warning("Pollinations/%s не сработал: %s", mode, err)
-        await asyncio.sleep(random.uniform(1, 3))
-    return None, "Pollinations: все модели недоступны"
-
-
-# ── Скачивание музыки ─────────────────────────────────────────────────────────
-
-
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
 
 async def _cobalt_download(query: str) -> tuple:
     """
     Скачивает через cobalt.tools API.
-    Сначала ищем видео через yt-dlp --flat-playlist, потом отдаём URL в cobalt.
+    Сначала проверяет живые инстансы (с кэшированием мёртвых на 10 мин),
+    затем ищет видео через yt-dlp и пробует только живые инстансы.
     """
     import aiohttp, subprocess as _sp
+
+    # Шаг 0: получаем список живых инстансов
+    live_instances = await _cobalt_get_live_instances()
+    if not live_instances:
+        return None, "cobalt: все инстанции недоступны", None, None
+
+    logger.info("cobalt: живых инстансов: %d из %d", len(live_instances), len(set(_COBALT_ALL_INSTANCES)))
 
     # Шаг 1: найти YouTube ID через поиск
     try:
@@ -924,12 +787,6 @@ async def _cobalt_download(query: str) -> tuple:
     if not entries:
         return None, "ничего не найдено", None, None
 
-    COBALT_INSTANCES = [
-        "https://api.cobalt.tools",
-        "https://cobalt.imput.net",
-        "https://cbl.henhen1227.com",
-        "https://cobalt.tools",
-    ]
     headers = {
         "Accept":       "application/json",
         "Content-Type": "application/json",
@@ -938,7 +795,7 @@ async def _cobalt_download(query: str) -> tuple:
 
     for entry in entries[:3]:
         yt_url = f"https://www.youtube.com/watch?v={entry['id']}"
-        for instance in COBALT_INSTANCES:
+        for instance in live_instances:  # только живые!
             try:
                 logger.info("cobalt: %s → %s", instance, entry['title'][:40])
                 async with aiohttp.ClientSession() as session:
@@ -955,6 +812,7 @@ async def _cobalt_download(query: str) -> tuple:
                     ) as resp:
                         if resp.status != 200:
                             logger.info("cobalt %s: HTTP %d", instance, resp.status)
+                            # HTTP 400/405 — инстанс жив, но не принял запрос. Не помечаем мёртвым.
                             continue
                         data = await resp.json(content_type=None)
                         status = data.get("status", "")
@@ -1005,20 +863,24 @@ async def _cobalt_download(query: str) -> tuple:
                                         _sh.rmtree(tmpdir, ignore_errors=True)
 
                                 logger.info("✓ cobalt: %dKB '%s'", len(audio_bytes) // 1024, entry['title'][:30])
+                                # Помечаем инстанс как живой
+                                _cobalt_instance_cache[instance] = (True, time.time())
                                 return audio_bytes, entry["title"], entry["uploader"], entry["duration"]
             except asyncio.TimeoutError:
                 logger.info("cobalt %s: таймаут", instance)
+                # Таймаут — возможно временно, не помечаем мёртвым надолго
             except Exception as e:
-                logger.info("cobalt %s: %s", instance, str(e)[:80])
+                err = str(e)
+                logger.info("cobalt %s: %s", instance, err[:80])
+                # DNS/connect ошибка — помечаем мёртвым
+                if "Name or service not known" in err or "Cannot connect" in err or "No address" in err:
+                    _cobalt_instance_cache[instance] = (False, time.time())
+                    logger.info("cobalt: помечаем %s как мёртвый на %d мин", instance, _COBALT_DEAD_TTL // 60)
 
     return None, "cobalt: все инстанции недоступны", None, None
 
 
 async def _youtube_download(query: str) -> tuple:
-    """
-    Скачивает аудио напрямую с YouTube через yt-dlp + ffmpeg.
-    Основной метод для Railway (без SoundCloud).
-    """
     import subprocess as _sp
     import glob
     import shutil as _sh
@@ -1031,7 +893,6 @@ async def _youtube_download(query: str) -> tuple:
     loop = asyncio.get_event_loop()
 
     def _yt_search_and_download():
-        # Поиск первых 3 подходящих видео
         try:
             search = _sp.run(
                 ["yt-dlp", "--flat-playlist",
@@ -1107,17 +968,14 @@ async def _youtube_download(query: str) -> tuple:
 
 async def download_music_by_query(query: str):
     """
-    Цепочка: [1] Cobalt → [2] YouTube yt-dlp
-    SoundCloud исключён — Railway-серверный IP плохо работает с ним.
+    Цепочка: [1] Cobalt (только живые инстансы) → [2] YouTube yt-dlp
     """
-    # [1/2] Cobalt (быстро, без cookies)
     logger.info("Music [1/2]: cobalt.tools → '%s'", query)
     result = await _cobalt_download(query)
     if result[0]:
         return result
     logger.warning("cobalt.tools не сработал: %s", result[1])
 
-    # [2/2] YouTube напрямую через yt-dlp + ffmpeg
     logger.info("Music [2/2]: YouTube yt-dlp → '%s'", query)
     result = await _youtube_download(query)
     if result[0]:
@@ -1197,19 +1055,17 @@ async def search_image(query: str):
 async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
     import aiohttp, subprocess as _sp
 
-    COBALT_INSTANCES = [
-        "https://api.cobalt.tools",
-        "https://cobalt.imput.net",
-        "https://cbl.henhen1227.com",
-        "https://cobalt.tools",
-    ]
+    live_instances = await _cobalt_get_live_instances()
+    if not live_instances:
+        return None, "cobalt video: все инстанции недоступны"
+
     headers = {
         "Accept":       "application/json",
         "Content-Type": "application/json",
         "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
-    for instance in COBALT_INSTANCES:
+    for instance in live_instances:
         try:
             logger.info("cobalt video: %s → %s", instance, title[:30])
             async with aiohttp.ClientSession() as session:
@@ -1276,7 +1132,10 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
         except asyncio.TimeoutError:
             logger.info("cobalt video %s: таймаут", instance)
         except Exception as e:
-            logger.info("cobalt video %s: %s", instance, str(e)[:60])
+            err = str(e)
+            logger.info("cobalt video %s: %s", instance, err[:60])
+            if "Name or service not known" in err or "Cannot connect" in err or "No address" in err:
+                _cobalt_instance_cache[instance] = (False, time.time())
 
     return None, "cobalt video: все инстанции недоступны"
 
@@ -1317,7 +1176,6 @@ async def fetch_meme_melstroy() -> tuple:
         if len(parts) < 2:
             continue
         vid_id, title = parts[0].strip(), parts[1].strip()
-        yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             for fmt in VIDEO_FORMATS:
@@ -1331,9 +1189,9 @@ async def fetch_meme_melstroy() -> tuple:
                     )
                     if r.returncode != 0:
                         stderr = r.stderr or ""
-                    if "not available" in stderr or "Requested format" in stderr:
-                        logger.info("fmt=%r недоступен для %s", fmt, vid_id)
-                        continue
+                        if "not available" in stderr or "Requested format" in stderr:
+                            logger.info("fmt=%r недоступен для %s", fmt, vid_id)
+                            continue
                     import glob
                     files = glob.glob(os.path.join(tmpdir, f"v{fmt}.*"))
                     if files:
@@ -1767,7 +1625,6 @@ def _start_ngrok(domain: str):
 
 # ── Умный энхансер промптов ──────────────────────────────────────────────────
 
-# (набор EN-слов) → суффикс стиля
 _STYLE_RULES = [
     ({"portrait","person","girl","boy","woman","man","face","character","model","people"},
      "photorealistic portrait, professional studio lighting, 85mm lens, sharp focus, soft bokeh, 8k uhd"),
@@ -1791,7 +1648,6 @@ _STYLE_RULES = [
 _QUALITY_TAIL = "masterpiece, best quality, ultra-detailed, sharp focus, professional"
 _ENHANCED = {"masterpiece","artstation","8k","photorealistic","cinematic","ultra-detailed"}
 
-# Паттерн тренировочного списка (3х8, 3x8 и т.п.)
 _WORKOUT_RE = re.compile(r'(\d+\s*[хxХX]\s*\d+)', re.IGNORECASE)
 
 
@@ -1801,7 +1657,6 @@ def _is_workout_list(text: str) -> bool:
 
 
 def _enhance_prompt(prompt_en: str) -> str:
-    """Добавляет стиль и теги качества. Итог ≤ 400 символов."""
     low = prompt_en.lower()
     if sum(1 for m in _ENHANCED if m in low) >= 2:
         return (prompt_en + ", " + _QUALITY_TAIL)[:400]
@@ -1818,10 +1673,8 @@ def _enhance_prompt(prompt_en: str) -> str:
 
 # ── Воркер очереди рисования ──────────────────────────────────────────────────
 
-# Глобальный cooldown между всеми генерациями (не per-chat)
-# Это ключевой параметр: 90 сек = ~40 генераций/час = квота не исчерпывается
 _GLOBAL_LAST_GEN: float = 0.0
-_GLOBAL_GEN_LOCK: asyncio.Lock | None = None  # инициализируется в run_bot
+_GLOBAL_GEN_LOCK: asyncio.Lock | None = None
 
 def _global_lock() -> asyncio.Lock:
     global _GLOBAL_GEN_LOCK
@@ -1831,13 +1684,8 @@ def _global_lock() -> asyncio.Lock:
 
 
 async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
-    """
-    Переводит → улучшает промпт → генерирует через g4f.
-    Если промпт — список упражнений, строит визуальный промпт вместо буквального перевода.
-    """
     global _GLOBAL_LAST_GEN
 
-    # Тренировочный список → осмысленный визуальный промпт
     if _is_workout_list(prompt_raw):
         prompt_en = (
             "athletic person doing intense workout in modern gym, "
@@ -1851,15 +1699,6 @@ async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
     prompt_final = _enhance_prompt(prompt_en)
     logger.info("Draw: enhanced prompt len=%d for: %s", len(prompt_final), prompt_raw[:40].replace("\n", " "))
 
-    # ── [1] Perchance / Olike-AI (без квоты, 3 режима: pollen→buzz→fresh) ─────
-    logger.info("Draw [1/2]: Perchance/olike-ai...")
-    image_bytes, error_str = await generate_image_perchance_all_modes(prompt_final)
-    if image_bytes:
-        return image_bytes, prompt_raw
-    logger.warning("Draw [1/2]: Perchance не сработал: %s", error_str)
-
-    # ── [2] g4f (Blackbox → DeepInfra → HF) ────────────────────────────────
-    logger.info("Draw [2/2]: g4f fallback...")
     image_bytes, error_str = await generate_image_g4f(prompt_final)
     if image_bytes:
         return image_bytes, prompt_raw
@@ -1867,10 +1706,6 @@ async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
 
 
 async def _draw_queue_worker(chat_id: int, bot):
-    """
-    Воркер очереди рисования.
-    Глобальный cooldown между генерациями — не даёт исчерпать HF квоту.
-    """
     from aiogram.types import BufferedInputFile
     global _GLOBAL_LAST_GEN
 
@@ -1881,14 +1716,13 @@ async def _draw_queue_worker(chat_id: int, bot):
         while not queue.empty():
             message, prompt_raw = await queue.get()
 
-            # ── Глобальный cooldown (90 сек между генерациями) ───────────────
             async with _global_lock():
                 gap = time.time() - _GLOBAL_LAST_GEN
                 if gap < DRAW_COOLDOWN_SEC:
                     wait = DRAW_COOLDOWN_SEC - gap + random.uniform(0, 8)
                     logger.info("Draw: глобальный cooldown %.1f сек...", wait)
                     await asyncio.sleep(wait)
-                _GLOBAL_LAST_GEN = time.time()  # резервируем слот
+                _GLOBAL_LAST_GEN = time.time()
 
             status_msg = await message.reply("🎨 Рисую, подожди (~30–90 сек)...")
             try:
@@ -1897,9 +1731,7 @@ async def _draw_queue_worker(chat_id: int, bot):
                 _GLOBAL_LAST_GEN = time.time()
 
                 if not image_bytes:
-                    await status_msg.edit_text(
-                        f"😔 Не вышло: {result_info}"
-                    )
+                    await status_msg.edit_text(f"😔 Не вышло: {result_info}")
                 else:
                     photo = BufferedInputFile(image_bytes, filename="draw.png")
                     caption = f"🎨 <b>{prompt_raw[:200]}</b>"
@@ -1909,7 +1741,6 @@ async def _draw_queue_worker(chat_id: int, bot):
                     except Exception:
                         pass
 
-                # Сообщаем следующему в очереди
                 if not queue.empty():
                     elapsed  = time.time() - _GLOBAL_LAST_GEN
                     wait_est = max(0, DRAW_COOLDOWN_SEC - elapsed) + 30
@@ -1933,6 +1764,8 @@ async def _draw_queue_worker(chat_id: int, bot):
                 queue.task_done()
     finally:
         _draw_queue_busy[chat_id] = False
+
+
 # ── Основной цикл бота ────────────────────────────────────────────────────────
 
 async def run_bot(backend=None):
@@ -2244,7 +2077,6 @@ async def run_bot(backend=None):
                 await message.reply("❌ Промпт слишком длинный (макс 300 символов)")
                 return
 
-            # Инициализируем очередь для чата
             if chat_id not in _draw_queues:
                 _draw_queues[chat_id]     = asyncio.Queue()
                 _draw_queue_busy[chat_id] = False
@@ -2256,7 +2088,6 @@ async def run_bot(backend=None):
                 await message.reply("🚫 Очередь переполнена (макс 5). Попробуй позже.")
                 return
 
-            # Сообщаем пользователю его позицию в очереди
             if _draw_queue_busy[chat_id] or pos > 0:
                 await message.reply(
                     f"⏳ Ты в очереди — позиция <b>{pos + 1}</b>. Скоро нарисую!",
@@ -2265,7 +2096,6 @@ async def run_bot(backend=None):
 
             await queue.put((message, prompt_raw))
 
-            # Запускаем worker если не запущен
             if not _draw_queue_busy[chat_id]:
                 asyncio.create_task(_draw_queue_worker(chat_id, bot))
             return
