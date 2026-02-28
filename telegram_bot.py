@@ -436,144 +436,15 @@ HF_MODELS = [
 ]
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 
-# ── Очередь картинок ──────────────────────────────────────────────────────────
+# ── Очередь картинок на чат (1 генерация + 40 сек между) ─────────────────────
 DRAW_TRIGGER      = "жужа нарисуй"
-DRAW_COOLDOWN_SEC = 55           # пауза между генерациями (глобально по всему боту)
-_draw_cooldowns: dict[int, float] = {}
+DRAW_COOLDOWN_SEC = 90          # 90 сек между генерациями — беречь HF квоту (75сGPU/сутки)
+_draw_cooldowns: dict[int, float] = {}  # переопределяем: теперь это per-chat
 
-# Глобальная очередь (один воркер на весь бот — ни один провайдер не получает
-# два запроса одновременно, что является главной причиной банов)
-_global_draw_queue: asyncio.Queue | None = None   # инициализируется в run_bot
-_global_draw_busy:  bool = False
-_global_draw_last_done: float = 0.0               # время конца последней генерации
-
-# Per-chat очереди остаются для позиции в очереди и удобства
+# Очереди: chat_id → asyncio.Queue с элементами (message, prompt_raw, prompt_en)
 _draw_queues:     dict[int, asyncio.Queue]  = {}
 _draw_queue_busy: dict[int, bool]           = {}
-_draw_last_done:  dict[int, float]          = {}
-
-# Антибан: кулдаун per-model (секунд) после последнего использования
-_model_last_used:    dict[str, float] = {}
-_MODEL_COOLDOWN_SEC = 120   # одну и ту же модель не дёргаем чаще раза в 2 минуты
-_model_fail_count:   dict[str, int]   = {}   # счётчик ошибок per-model
-
-# ── Умный энхансер промптов ───────────────────────────────────────────────────
-
-# Правила: (ключевые слова в промпте на английском) → (стиль-суффикс)
-_STYLE_RULES: list[tuple[set, str]] = [
-    (
-        {"portrait", "person", "girl", "boy", "woman", "man", "face", "character",
-         "model", "people"},
-        "photorealistic portrait, professional studio lighting, 85mm lens, "
-        "soft bokeh background, highly detailed skin, sharp eyes, 8k uhd, "
-        "award winning photography"
-    ),
-    (
-        {"landscape", "nature", "forest", "mountain", "sea", "ocean", "sunset",
-         "sunrise", "sky", "field", "river", "lake", "valley"},
-        "epic landscape photography, golden hour lighting, dramatic clouds, "
-        "hyper detailed, National Geographic style, 8k uhd, HDR, "
-        "volumetric light, stunning composition"
-    ),
-    (
-        {"city", "street", "urban", "building", "architecture", "night",
-         "town", "downtown", "alley"},
-        "cinematic urban photography, neon lights, rain wet reflections, "
-        "dramatic shadows, 35mm film, moody atmosphere, highly detailed, 4k"
-    ),
-    (
-        {"anime", "manga", "cartoon", "chibi", "waifu"},
-        "anime style illustration, vibrant colors, dynamic composition, "
-        "detailed linework, studio quality artwork, trending on pixiv, "
-        "beautiful dramatic lighting, cel shading"
-    ),
-    (
-        {"fantasy", "dragon", "magic", "wizard", "castle", "fairy", "elf",
-         "knight", "sword", "sorcerer", "dungeon"},
-        "epic fantasy digital art, intricate details, magical atmosphere, "
-        "cinematic lighting, artstation trending, 8k, dramatic composition, "
-        "concept art, highly detailed"
-    ),
-    (
-        {"space", "galaxy", "planet", "stars", "cosmos", "nebula", "astronaut",
-         "universe", "cosmic", "asteroid"},
-        "photorealistic space art, NASA concept style, cosmic scale, "
-        "vibrant nebula colors, ultra detailed, 8k, cinematic, "
-        "deep starfield background, atmospheric glow"
-    ),
-    (
-        {"cat", "dog", "animal", "pet", "fox", "wolf", "bird", "lion", "tiger",
-         "bear", "horse", "rabbit", "deer", "wildlife"},
-        "professional wildlife photography, razor sharp focus, natural bokeh, "
-        "100mm telephoto lens, highly detailed fur and texture, "
-        "golden hour lighting, 8k, National Geographic"
-    ),
-    (
-        {"food", "cake", "pizza", "coffee", "dish", "dessert", "meal",
-         "restaurant", "cooking", "chef"},
-        "professional food photography, soft studio diffused lighting, "
-        "shallow depth of field, high resolution, appetizing colors, "
-        "Canon 5D, 50mm macro, Michelin star presentation"
-    ),
-    (
-        {"cyberpunk", "futuristic", "robot", "sci-fi", "neon", "android",
-         "cyborg", "hologram", "mecha"},
-        "cyberpunk concept art, neon-lit streets, hyperdetailed chrome surfaces, "
-        "holographic effects, artstation trending, dark rainy atmosphere, "
-        "moody cinematic lighting, 8k"
-    ),
-    (
-        {"interior", "room", "house", "home", "bedroom", "kitchen",
-         "living room", "office", "studio"},
-        "professional architectural interior photography, wide angle lens, "
-        "soft ambient lighting, highly detailed textures, 8k, "
-        "interior design magazine quality, sharp perspective"
-    ),
-]
-
-# Минимальный суффикс качества — добавляется всегда
-_QUALITY_TAIL = "masterpiece, best quality, ultra-detailed, sharp focus, professional"
-
-# Маркеры «промпт уже прокачан»
-_ENHANCED_MARKERS = {"masterpiece", "artstation", "8k", "photorealistic",
-                     "cinematic", "ultra-detailed", "highly detailed"}
-
-
-def enhance_prompt(prompt_en: str) -> str:
-    """
-    Принимает английский промпт, возвращает улучшенную версию.
-    Автоматически определяет стиль по ключевым словам.
-    Итоговая длина ≤ 450 символов (g4f/flux лучше работают с коротким промптом).
-    """
-    lower = prompt_en.lower()
-
-    # Если уже детальный — только хвост качества
-    if sum(1 for m in _ENHANCED_MARKERS if m in lower) >= 2:
-        result = f"{prompt_en}, {_QUALITY_TAIL}"
-        return result[:450]
-
-    # Ищем лучший стиль
-    best_suffix = ""
-    best_score  = 0
-    for keywords, suffix in _STYLE_RULES:
-        score = sum(1 for kw in keywords if kw in lower)
-        if score > best_score:
-            best_score  = score
-            best_suffix = suffix
-
-    if not best_suffix:
-        # Универсальный fallback
-        best_suffix = (
-            "highly detailed digital illustration, "
-            "cinematic dramatic lighting, trending on artstation, "
-            "concept art, professional quality, vivid colors"
-        )
-
-    result = f"{prompt_en}, {best_suffix}, {_QUALITY_TAIL}"
-    # Обрезаем до 450 символов, не разрывая слова
-    if len(result) > 450:
-        result = result[:450].rsplit(",", 1)[0]
-    return result
+_draw_last_done:  dict[int, float]          = {}   # время завершения последней генерации
 
 
 # ── Генерация изображений ─────────────────────────────────────────────────────
@@ -663,108 +534,147 @@ async def generate_image_local(prompt: str) -> tuple:
 
 async def generate_image_g4f(prompt: str) -> tuple:
     """
-    Генерация через g4f с антибан-защитой:
-    - модели перебираются в порядке приоритета
-    - каждая модель используется не чаще раза в _MODEL_COOLDOWN_SEC секунд
-    - при превышении ошибок модель временно выключается на 10 минут
-    - между попытками случайная пауза 3-8 сек (имитация живого юзера)
+    Генерация через g4f.
+
+    Почему квота кончается:
+      flux без провайдера = HuggingFace Inference API = 75 сек GPU/сутки.
+      Каждая генерация ~15 сек GPU => максимум ~5 картинок в сутки через этот путь.
+
+    Стратегия (порядок попыток):
+      1. Blackbox (blackbox.ai) — их собственный flux/sdxl, не HF квота, бесплатно
+      2. flux без провайдера — только если Blackbox упал, тратим HF квоту бережно
+      3. sdxl без провайдера — совсем запасной вариант
     """
     import aiohttp
     try:
         from g4f.client import Client as G4FClient
+        import g4f.Provider as Providers
     except ImportError:
-        return None, "g4f не установлен (pip install g4f)"
-
-    # Приоритетный список моделей
-    # flux/flux-schnell — самые стабильные бесплатные
-    ALL_MODELS = [
-        "flux",
-        "flux-schnell",
-        "flux-dev",
-        "sdxl",
-        "sd-3",
-        "dall-e-3",
-        "flux-pro",
-        "midjourney",
-    ]
-
-    now = time.time()
-
-    # Фильтруем модели по кулдауну и количеству ошибок
-    def _model_available(m: str) -> bool:
-        last_used  = _model_last_used.get(m, 0)
-        fail_count = _model_fail_count.get(m, 0)
-        # Если много ошибок — даём остыть дольше
-        cooldown = _MODEL_COOLDOWN_SEC + (fail_count * 60)
-        return (now - last_used) >= cooldown
-
-    models_to_try = [m for m in ALL_MODELS if _model_available(m)]
-
-    # Если все на кулдауне — берём ту, что остыла дольше всего
-    if not models_to_try:
-        models_to_try = sorted(ALL_MODELS, key=lambda m: _model_last_used.get(m, 0))[:3]
-        logger.warning("g4f: все модели на кулдауне, берём самые старые: %s", models_to_try)
+        return None, "g4f не установлен (pip install -U g4f)"
 
     loop = asyncio.get_event_loop()
 
-    for model in models_to_try:
+    # ── Попытка 1: Blackbox.ai (собственный flux, без HF квоты) ──────────────
+    for bb_model in ("flux", "sdxl", "dall-e-3"):
         try:
-            def _gen(m=model, p=prompt):
+            def _gen_bb(m=bb_model):
                 client = G4FClient()
-                resp = client.images.generate(model=m, prompt=p, response_format="url")
+                resp = client.images.generate(
+                    model=m,
+                    prompt=prompt,
+                    provider=Providers.Blackbox,
+                    response_format="url",
+                )
                 return resp.data[0].url if resp.data else None
 
-            logger.info("g4f: пробуем model=%s (fail=%d)...", model, _model_fail_count.get(model, 0))
-            _model_last_used[model] = time.time()
-
-            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen), timeout=100)
-
-            if not img_url:
-                logger.warning("g4f [%s]: пустой URL", model)
-                _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
-                # Пауза между попытками (антибан)
-                await asyncio.sleep(random.uniform(4, 9))
-                continue
-
-            # Скачиваем картинку
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    img_url,
-                    timeout=aiohttp.ClientTimeout(total=60),
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-                ) as resp:
-                    if resp.status == 200:
-                        image_bytes = await resp.read()
-                        if len(image_bytes) > 1000:
-                            logger.info("g4f [%s]: ✓ %dKB", model, len(image_bytes) // 1024)
-                            # Сбрасываем счётчик ошибок при успехе
-                            _model_fail_count[model] = 0
-                            return image_bytes, None
-                        else:
-                            logger.warning("g4f [%s]: файл слишком мал (%d байт)", model, len(image_bytes))
-                    else:
-                        logger.warning("g4f [%s]: скачивание HTTP %d", model, resp.status)
-
-            _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
-            await asyncio.sleep(random.uniform(4, 9))
-
+            logger.info("g4f: Blackbox/%s...", bb_model)
+            img_url = await asyncio.wait_for(
+                loop.run_in_executor(None, _gen_bb), timeout=90
+            )
+            if img_url:
+                img_bytes = await _download_image_url(img_url)
+                if img_bytes:
+                    logger.info("g4f: Blackbox/%s ✓ %dKB", bb_model, len(img_bytes)//1024)
+                    return img_bytes, None
         except asyncio.TimeoutError:
-            logger.warning("g4f [%s]: таймаут", model)
-            _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
-            await asyncio.sleep(random.uniform(3, 7))
+            logger.warning("g4f: Blackbox/%s таймаут", bb_model)
+        except Exception as e:
+            logger.warning("g4f: Blackbox/%s: %s", bb_model, str(e)[:100])
+        await asyncio.sleep(random.uniform(2, 4))
+
+    # ── Попытка 2: DeepInfraImage (не HF квота) ───────────────────────────────
+    try:
+        def _gen_di():
+            client = G4FClient()
+            resp = client.images.generate(
+                model="flux",
+                prompt=prompt,
+                provider=Providers.DeepInfraImage,
+                response_format="url",
+            )
+            return resp.data[0].url if resp.data else None
+
+        logger.info("g4f: DeepInfraImage/flux...")
+        img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_di), timeout=90)
+        if img_url:
+            img_bytes = await _download_image_url(img_url)
+            if img_bytes:
+                logger.info("g4f: DeepInfraImage ✓ %dKB", len(img_bytes)//1024)
+                return img_bytes, None
+    except asyncio.TimeoutError:
+        logger.warning("g4f: DeepInfraImage таймаут")
+    except Exception as e:
+        logger.warning("g4f: DeepInfraImage: %s", str(e)[:100])
+    await asyncio.sleep(random.uniform(2, 4))
+
+    # ── Попытка 3: flux автовыбор (HF квота — используем бережно) ────────────
+    # Трекаем сколько раз сегодня уже тратили HF квоту
+    today = time.strftime("%Y-%m-%d")
+    hf_key = f"hf_quota_{today}"
+    hf_used = getattr(generate_image_g4f, "_hf_counter", {})
+    generate_image_g4f._hf_counter = hf_used
+    hf_count_today = hf_used.get(hf_key, 0)
+
+    if hf_count_today >= 4:
+        logger.warning("g4f: HF квота исчерпана на сегодня (%d/4 использовано)", hf_count_today)
+        return None, f"Квота исчерпана на сегодня ({hf_count_today}/4 генераций). Попробуй завтра или другой промпт."
+
+    for model in ("flux", "sdxl"):
+        try:
+            def _gen_hf(m=model):
+                client = G4FClient()
+                resp = client.images.generate(model=m, prompt=prompt, response_format="url")
+                return resp.data[0].url if resp.data else None
+
+            logger.info("g4f: HF/%s (использование %d/4 сегодня)...", model, hf_count_today+1)
+            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen_hf), timeout=90)
+            if img_url:
+                img_bytes = await _download_image_url(img_url)
+                if img_bytes:
+                    hf_used[hf_key] = hf_count_today + 1
+                    logger.info("g4f: HF/%s ✓ %dKB (использовано %d/4)", model, len(img_bytes)//1024, hf_used[hf_key])
+                    return img_bytes, None
+        except asyncio.TimeoutError:
+            logger.warning("g4f: HF/%s таймаут", model)
         except Exception as e:
             err = str(e)[:120]
-            logger.warning("g4f [%s]: %s", model, err)
-            _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
-            # Если явный рейт-лимит — ждём дольше
-            if any(kw in err.lower() for kw in ("rate", "limit", "quota", "429", "ban", "blocked")):
-                logger.warning("g4f [%s]: похоже рейт-лимит, жду 30 сек...", model)
-                await asyncio.sleep(30)
-            else:
-                await asyncio.sleep(random.uniform(3, 8))
+            logger.warning("g4f: HF/%s: %s", model, err)
+            if "quota" in err.lower() or "exceeded" in err.lower():
+                hf_used[hf_key] = 99  # помечаем как исчерпанную
+                logger.warning("g4f: HF квота исчерпана, блокируем до завтра")
+                return None, "HF квота исчерпана. Попробуй завтра."
+        await asyncio.sleep(random.uniform(3, 6))
 
-    return None, "g4f: все доступные модели не дали результат"
+    return None, "g4f: все провайдеры недоступны"
 
+
+async def _download_image_url(url: str) -> bytes | None:
+    """Скачивает картинку по URL или декодирует base64 data URI."""
+    import aiohttp
+    if not url:
+        return None
+    # base64 data URI
+    if url.startswith("data:image"):
+        try:
+            _, b64 = url.split(",", 1)
+            data = base64.b64decode(b64)
+            return data if len(data) > 1000 else None
+        except Exception:
+            return None
+    # обычный URL
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=60),
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    return data if len(data) > 1000 else None
+    except Exception as e:
+        logger.warning("_download_image_url: %s", str(e)[:80])
+    return None
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
 
@@ -1644,122 +1554,165 @@ def _start_ngrok(domain: str):
     logger.info("ngrok запущен в фоне → https://%s", domain)
 
 
+# ── Умный энхансер промптов ──────────────────────────────────────────────────
+
+# (набор EN-слов) → суффикс стиля
+_STYLE_RULES = [
+    ({"portrait","person","girl","boy","woman","man","face","character","model","people"},
+     "photorealistic portrait, professional studio lighting, 85mm lens, sharp focus, soft bokeh, 8k uhd"),
+    ({"landscape","nature","forest","mountain","sea","ocean","sunset","sunrise","sky","field","river","lake"},
+     "epic landscape, golden hour lighting, dramatic sky, hyper detailed, 8k HDR, volumetric light"),
+    ({"city","street","urban","building","architecture","night","downtown","alley"},
+     "cinematic urban photo, neon lights, rain wet reflections, 35mm film, moody, 4k"),
+    ({"anime","manga","cartoon","chibi","waifu"},
+     "anime style illustration, vibrant colors, detailed linework, pixiv trending, studio quality, cel shading"),
+    ({"fantasy","dragon","magic","wizard","castle","fairy","elf","knight","sword"},
+     "epic fantasy digital art, intricate details, magical atmosphere, artstation trending, 8k"),
+    ({"space","galaxy","planet","stars","cosmos","nebula","astronaut","universe"},
+     "photorealistic space art, NASA concept, cosmic scale, vibrant nebula, 8k cinematic"),
+    ({"cat","dog","animal","pet","fox","wolf","bird","lion","tiger","bear","rabbit"},
+     "wildlife photography, sharp focus, natural bokeh, 100mm lens, detailed fur texture, 8k"),
+    ({"food","cake","pizza","coffee","dish","dessert","burger","meal"},
+     "professional food photography, soft studio light, shallow DOF, appetizing, Canon 5D"),
+    ({"cyberpunk","futuristic","robot","sci-fi","neon","android","cyborg","mecha"},
+     "cyberpunk concept art, neon-lit, hyperdetailed chrome, artstation, dark rainy atmosphere, 8k"),
+]
+_QUALITY_TAIL = "masterpiece, best quality, ultra-detailed, sharp focus, professional"
+_ENHANCED = {"masterpiece","artstation","8k","photorealistic","cinematic","ultra-detailed"}
+
+# Паттерн тренировочного списка (3х8, 3x8 и т.п.)
+_WORKOUT_RE = re.compile(r'(\d+\s*[хxХX]\s*\d+)', re.IGNORECASE)
+
+
+def _is_workout_list(text: str) -> bool:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return len(lines) >= 3 and sum(1 for l in lines if _WORKOUT_RE.search(l)) >= 2
+
+
+def _enhance_prompt(prompt_en: str) -> str:
+    """Добавляет стиль и теги качества. Итог ≤ 400 символов."""
+    low = prompt_en.lower()
+    if sum(1 for m in _ENHANCED if m in low) >= 2:
+        return (prompt_en + ", " + _QUALITY_TAIL)[:400]
+    best, score = "", 0
+    for kws, suf in _STYLE_RULES:
+        s = sum(1 for w in kws if w in low)
+        if s > score:
+            score, best = s, suf
+    if not best:
+        best = "highly detailed digital art, cinematic lighting, trending on artstation, vivid colors"
+    result = f"{prompt_en}, {best}, {_QUALITY_TAIL}"
+    return result[:400].rsplit(",", 1)[0] if len(result) > 400 else result
+
+
 # ── Воркер очереди рисования ──────────────────────────────────────────────────
+
+# Глобальный cooldown между всеми генерациями (не per-chat)
+# Это ключевой параметр: 90 сек = ~40 генераций/час = квота не исчерпывается
+_GLOBAL_LAST_GEN: float = 0.0
+_GLOBAL_GEN_LOCK: asyncio.Lock | None = None  # инициализируется в run_bot
+
+def _global_lock() -> asyncio.Lock:
+    global _GLOBAL_GEN_LOCK
+    if _GLOBAL_GEN_LOCK is None:
+        _GLOBAL_GEN_LOCK = asyncio.Lock()
+    return _GLOBAL_GEN_LOCK
+
 
 async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
     """
-    Переводит промпт, улучшает его, затем генерирует картинку через g4f.
-    Возвращает (bytes, prompt_raw) при успехе или (None, error_str) при ошибке.
+    Переводит → улучшает промпт → генерирует через g4f.
+    Если промпт — список упражнений, строит визуальный промпт вместо буквального перевода.
     """
-    # 1. Перевод на английский
-    prompt_en = await translate_prompt_to_english(prompt_raw)
+    global _GLOBAL_LAST_GEN
 
-    # 2. Улучшение промпта (добавляем стиль и теги качества)
-    prompt_enhanced = enhance_prompt(prompt_en)
-    logger.info(
-        "Draw: '%s' → en='%s' → enhanced (len=%d)",
-        prompt_raw[:40], prompt_en[:40], len(prompt_enhanced)
-    )
+    # Тренировочный список → осмысленный визуальный промпт
+    if _is_workout_list(prompt_raw):
+        prompt_en = (
+            "athletic person doing intense workout in modern gym, "
+            "training with barbell and dumbbells, focused and motivated, "
+            "dynamic pose, dramatic gym lighting, professional sports photography"
+        )
+        logger.info("Draw: workout список → визуальный промпт")
+    else:
+        prompt_en = await translate_prompt_to_english(prompt_raw)
 
-    # 3. Генерация
-    image_bytes, error_str = await generate_image_g4f(prompt_enhanced)
+    prompt_final = _enhance_prompt(prompt_en)
+    logger.info("Draw: enhanced prompt len=%d for: %s", len(prompt_final), prompt_raw[:40].replace("\n", " "))
+
+    image_bytes, error_str = await generate_image_g4f(prompt_final)
     if image_bytes:
         return image_bytes, prompt_raw
-    logger.warning("Draw: g4f провалился: %s", error_str)
-    return None, error_str
+    return None, (error_str or "неизвестная ошибка")
 
 
-async def _global_draw_worker(bot):
+async def _draw_queue_worker(chat_id: int, bot):
     """
-    Единственный глобальный воркер генерации картинок для всего бота.
-
-    Почему глобальный, а не per-chat:
-    • g4f-провайдеры банят по IP при параллельных запросах — даже 2 одновременных
-      запроса к flux от разных чатов могут дать рейт-лимит.
-    • Глобальная очередь + пауза DRAW_COOLDOWN_SEC между генерациями полностью
-      исключает параллельные обращения к API.
-
-    Элементы очереди: (message, prompt_raw, chat_id)
+    Воркер очереди рисования.
+    Глобальный cooldown между генерациями — не даёт исчерпать HF квоту.
     """
     from aiogram.types import BufferedInputFile
+    global _GLOBAL_LAST_GEN
 
-    global _global_draw_busy, _global_draw_last_done
-
-    _global_draw_busy = True
-    queue = _global_draw_queue
+    _draw_queue_busy[chat_id] = True
+    queue = _draw_queues[chat_id]
 
     try:
         while not queue.empty():
-            message, prompt_raw, chat_id = await queue.get()
+            message, prompt_raw = await queue.get()
 
-            # ── Ждём глобальный кулдаун между генерациями ────────────────────
-            gap = time.time() - _global_draw_last_done
-            if gap < DRAW_COOLDOWN_SEC:
-                wait_sec = DRAW_COOLDOWN_SEC - gap
-                # Дополнительный случайный джиттер 0–10 сек (антибан)
-                wait_sec += random.uniform(0, 10)
-                logger.info(
-                    "Draw global worker: ждём %.1f сек (антибан пауза)", wait_sec
-                )
-                await asyncio.sleep(wait_sec)
+            # ── Глобальный cooldown (90 сек между генерациями) ───────────────
+            async with _global_lock():
+                gap = time.time() - _GLOBAL_LAST_GEN
+                if gap < DRAW_COOLDOWN_SEC:
+                    wait = DRAW_COOLDOWN_SEC - gap + random.uniform(0, 8)
+                    logger.info("Draw: глобальный cooldown %.1f сек...", wait)
+                    await asyncio.sleep(wait)
+                _GLOBAL_LAST_GEN = time.time()  # резервируем слот
 
             status_msg = await message.reply("🎨 Рисую, подожди (~30–90 сек)...")
-
             try:
                 image_bytes, result_info = await _do_generate_image(prompt_raw)
-                _global_draw_last_done = time.time()
+                _draw_last_done[chat_id] = time.time()
+                _GLOBAL_LAST_GEN = time.time()
 
                 if not image_bytes:
                     await status_msg.edit_text(
-                        f"😔 Не получилось нарисовать: {result_info}\n"
-                        f"Попробуй чуть позже — провайдер временно недоступен."
+                        f"😔 Не вышло: {result_info}"
                     )
                 else:
                     photo = BufferedInputFile(image_bytes, filename="draw.png")
-                    await message.reply_photo(
-                        photo=photo,
-                        caption=f"🎨 <b>{prompt_raw}</b>",
-                        parse_mode="HTML",
-                    )
+                    caption = f"🎨 <b>{prompt_raw[:200]}</b>"
+                    await message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
                     try:
                         await status_msg.delete()
                     except Exception:
                         pass
 
-                # Уведомляем следующего в глобальной очереди
+                # Сообщаем следующему в очереди
                 if not queue.empty():
-                    # peek без изъятия
+                    elapsed  = time.time() - _GLOBAL_LAST_GEN
+                    wait_est = max(0, DRAW_COOLDOWN_SEC - elapsed) + 30
                     try:
-                        next_msg, _, _ = list(queue._queue)[0]  # type: ignore[attr-defined]
-                        elapsed   = time.time() - _global_draw_last_done
-                        wait_left = max(0, DRAW_COOLDOWN_SEC - elapsed) + 15  # +запас
+                        next_msg, _ = queue.queue[0]
                         await next_msg.reply(
-                            f"⏳ Ты следующий! Примерное ожидание ~{int(wait_left)} сек.",
+                            f"⏳ Скоро твоя очередь! ~{int(wait_est)} сек.",
                             parse_mode="HTML",
                         )
                     except Exception:
                         pass
 
             except Exception as e:
-                logger.exception("Draw global worker error: %s", e)
-                _global_draw_last_done = time.time()
+                logger.exception("Draw worker error: %s", e)
+                _GLOBAL_LAST_GEN = time.time()
                 try:
-                    await status_msg.edit_text(f"❌ Ошибка генерации: {str(e)[:100]}")
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
                 except Exception:
                     pass
             finally:
                 queue.task_done()
-
     finally:
-        _global_draw_busy = False
-
-
-# Оставляем старые переменные для обратной совместимости (не используются активно)
-async def _draw_queue_worker(chat_id: int, bot):
-    """Устаревший per-chat воркер — делегирует в глобальный."""
-    pass
-
-
+        _draw_queue_busy[chat_id] = False
 # ── Основной цикл бота ────────────────────────────────────────────────────────
 
 async def run_bot(backend=None):
@@ -1767,10 +1720,6 @@ async def run_bot(backend=None):
     from aiogram.types import Message, CallbackQuery
 
     _chat_state_load()
-
-    # Инициализируем глобальную очередь картинок
-    global _global_draw_queue
-    _global_draw_queue = asyncio.Queue()
 
     if not BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN не задан — бот не запущен")
@@ -2075,28 +2024,30 @@ async def run_bot(backend=None):
                 await message.reply("❌ Промпт слишком длинный (макс 300 символов)")
                 return
 
-            # Глобальная очередь — считаем сколько всего запросов ждёт
-            queue = _global_draw_queue
+            # Инициализируем очередь для чата
+            if chat_id not in _draw_queues:
+                _draw_queues[chat_id]     = asyncio.Queue()
+                _draw_queue_busy[chat_id] = False
+
+            queue = _draw_queues[chat_id]
             pos   = queue.qsize()
 
-            if pos >= 8:
-                await message.reply("🚫 Очередь переполнена (макс 8). Попробуй через пару минут.")
+            if pos >= 5:
+                await message.reply("🚫 Очередь переполнена (макс 5). Попробуй позже.")
                 return
 
-            # Сообщаем позицию + примерное время ожидания
-            if _global_draw_busy or pos > 0:
-                est_wait = (pos + 1) * (DRAW_COOLDOWN_SEC + 30)  # ~85 сек на генерацию
+            # Сообщаем пользователю его позицию в очереди
+            if _draw_queue_busy[chat_id] or pos > 0:
                 await message.reply(
-                    f"⏳ Ты в очереди — позиция <b>{pos + 1}</b>.\n"
-                    f"Примерное ожидание: ~{est_wait // 60} мин {est_wait % 60} сек.",
+                    f"⏳ Ты в очереди — позиция <b>{pos + 1}</b>. Скоро нарисую!",
                     parse_mode="HTML",
                 )
 
-            await queue.put((message, prompt_raw, chat_id))
+            await queue.put((message, prompt_raw))
 
-            # Запускаем глобальный воркер если не запущен
-            if not _global_draw_busy:
-                asyncio.create_task(_global_draw_worker(bot))
+            # Запускаем worker если не запущен
+            if not _draw_queue_busy[chat_id]:
+                asyncio.create_task(_draw_queue_worker(chat_id, bot))
             return
 
         if SEARCH_TRIGGER.lower() in text:
