@@ -79,6 +79,7 @@ TOGETHER_API_TOKEN  = _config("TOGETHER_API_TOKEN", "")
 GEMINI_API_KEY      = _config("GEMINI_API_KEY", "")
 REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
 MUKESH_API_KEY      = _config("MUKESH_API_KEY", "")
+STABILITY_API_KEY   = _config("STABILITY_API_KEY", "")
 TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
 
 logging.basicConfig(
@@ -534,13 +535,11 @@ async def generate_image_local(prompt: str) -> tuple:
 
 async def _generate_hf_image(prompt: str) -> tuple:
     """
-    HuggingFace Inference API — FLUX.1-schnell.
-    Нужен бесплатный токен: huggingface.co → Settings → Access Tokens → New token (Read).
-    Добавь в .env: HUGGINGFACE_TOKEN=hf_xxxxx
-    Бесплатный аккаунт даёт месячные кредиты.
+    HuggingFace router.huggingface.co (новый эндпоинт с 2025).
+    api-inference.huggingface.co задеприкейтили — теперь router.huggingface.co.
     """
     if not HUGGINGFACE_TOKEN:
-        return None, "HUGGINGFACE_TOKEN не задан (создай на huggingface.co бесплатно)"
+        return None, "HUGGINGFACE_TOKEN не задан"
     import aiohttp
 
     models = [
@@ -548,38 +547,38 @@ async def _generate_hf_image(prompt: str) -> tuple:
         "stabilityai/stable-diffusion-xl-base-1.0",
         "runwayml/stable-diffusion-v1-5",
     ]
-    headers = {
-        "Authorization": f"Bearer {HUGGINGFACE_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {HUGGINGFACE_TOKEN}"}
 
     async with aiohttp.ClientSession(headers=headers) as session:
         for model in models:
-            url = f"https://api-inference.huggingface.co/models/{model}"
+            url = f"https://router.huggingface.co/hf-inference/models/{model}"
             label = f"hf/{model.split('/')[-1]}"
             try:
                 logger.info("hf: пробуем %s...", label)
-                payload = {"inputs": prompt, "parameters": {"num_inference_steps": 4}}
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                async with session.post(
+                    url,
+                    json={"inputs": prompt, "parameters": {"num_inference_steps": 4}},
+                    timeout=aiohttp.ClientTimeout(total=70),
+                ) as resp:
                     if resp.status == 503:
-                        # Модель загружается — ждём и пробуем ещё раз
-                        body = await resp.json(content_type=None)
-                        wait = body.get("estimated_time", 20)
-                        logger.info("hf [%s]: модель загружается, ждём %.0f сек...", label, wait)
-                        await asyncio.sleep(min(wait, 25))
-                        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp2:
+                        data = await resp.json(content_type=None)
+                        wait = min(data.get("estimated_time", 20), 30)
+                        logger.info("hf [%s]: модель грузится, ждём %ds...", label, wait)
+                        await asyncio.sleep(wait)
+                        async with session.post(
+                            url,
+                            json={"inputs": prompt, "parameters": {"num_inference_steps": 4}},
+                            timeout=aiohttp.ClientTimeout(total=70),
+                        ) as resp2:
                             if resp2.status == 200:
                                 img_bytes = await resp2.read()
                                 if len(img_bytes) > 5000:
-                                    logger.info("hf [%s]: ✓ %dKB (retry)", label, len(img_bytes) // 1024)
+                                    logger.info("hf [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
                                     return img_bytes, None
-                        continue
-                    if resp.status == 429:
-                        logger.warning("hf [%s]: rate limit", label)
                         continue
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.warning("hf [%s]: HTTP %d: %s", label, resp.status, body[:80])
+                        logger.warning("hf [%s]: HTTP %d: %s", label, resp.status, body[:100])
                         continue
                     img_bytes = await resp.read()
                     ct = resp.headers.get("Content-Type", "")
@@ -595,8 +594,49 @@ async def _generate_hf_image(prompt: str) -> tuple:
     return None, "hf: все модели не ответили"
 
 
+async def _generate_stability_image(prompt: str) -> tuple:
+    """
+    Stability AI API — у тебя есть ключ STABILITY_API_KEY в Railway.
+    Модель: stable-image/generate/ultra (или core как фолбэк).
+    """
+    if not STABILITY_API_KEY:
+        return None, "STABILITY_API_KEY не задан"
+    import aiohttp
+
+    endpoints = [
+        ("https://api.stability.ai/v2beta/stable-image/generate/ultra", "ultra"),
+        ("https://api.stability.ai/v2beta/stable-image/generate/core",  "core"),
+    ]
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        "Accept": "image/*",
+    }
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for url, label in endpoints:
+            try:
+                logger.info("stability: пробуем %s...", label)
+                form = aiohttp.FormData()
+                form.add_field("prompt", prompt)
+                form.add_field("output_format", "png")
+                async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status == 200:
+                        img_bytes = await resp.read()
+                        if len(img_bytes) > 5000:
+                            logger.info("stability [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
+                            return img_bytes, None
+                    body = await resp.text() if resp.status != 200 else ""
+                    logger.warning("stability [%s]: HTTP %d %s", label, resp.status, body[:80])
+            except asyncio.TimeoutError:
+                logger.warning("stability [%s]: таймаут", label)
+            except Exception as e:
+                logger.warning("stability [%s]: %s", label, str(e)[:80])
+
+    return None, "stability: все эндпоинты не ответили"
+
+
 async def _generate_gemini_image(prompt: str) -> tuple:
-    """Gemini 2.0 Flash image generation — бесплатно 15 RPM / 1500 RPD."""
+    """Gemini 2.0 Flash image generation — 15 RPM бесплатно."""
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY не задан"
     import aiohttp, base64, json as _json
@@ -615,7 +655,7 @@ async def _generate_gemini_image(prompt: str) -> tuple:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 body = await resp.read()
                 if resp.status == 429:
-                    return None, "gemini: rate-limit 429 (подожди минуту)"
+                    return None, "gemini: rate-limit (429)"
                 if resp.status != 200:
                     return None, f"gemini: HTTP {resp.status}: {body[:100].decode(errors='replace')}"
                 data = _json.loads(body)
@@ -635,39 +675,36 @@ async def _generate_gemini_image(prompt: str) -> tuple:
 async def generate_image_g4f(prompt: str) -> tuple:
     """
     Генерация изображений. Порядок:
-      1. HuggingFace Inference API (FLUX.1-schnell) — нужен бесплатный HF токен
-         Создай на https://huggingface.co/settings/tokens (Read token, бесплатно)
-         Добавь в Railway: HUGGINGFACE_TOKEN=hf_xxxxxxxx
-      2. Gemini 2.0 Flash — бесплатно 15 RPM, уже есть ключ
-      3. Локальный SD — если установлен diffusers
+      1. HuggingFace (router.huggingface.co) — FLUX.1-schnell, HF токен есть
+      2. Stability AI — ключ есть в Railway (STABILITY_API_KEY)
+      3. Gemini 2.0 Flash — бесплатно 15 RPM
+      4. Локальный SD — если установлен diffusers
     """
-    # 1. HuggingFace — самый надёжный с токеном
     logger.info("Draw: пробуем HuggingFace...")
     img, err = await _generate_hf_image(prompt)
     if img:
         return img, None
     logger.warning("Draw: HF: %s", err)
 
-    # 2. Gemini
+    logger.info("Draw: пробуем Stability AI...")
+    img, err = await _generate_stability_image(prompt)
+    if img:
+        return img, None
+    logger.warning("Draw: Stability: %s", err)
+
     logger.info("Draw: пробуем Gemini...")
     img, err = await _generate_gemini_image(prompt)
     if img:
         return img, None
     logger.warning("Draw: Gemini: %s", err)
 
-    # 3. Локальный SD
     logger.info("Draw: пробуем локальный SD...")
     img, err = await generate_image_local(prompt)
     if img:
         return img, None
     logger.warning("Draw: SD: %s", err)
 
-    return None, (
-        "все методы провалились.\n"
-        "💡 Реши проблему: добавь HUGGINGFACE_TOKEN в Railway\n"
-        "→ huggingface.co → Settings → Access Tokens → New token (Read)\n"
-        "→ Railway → Variables → HUGGINGFACE_TOKEN = hf_xxxxx"
-    )
+    return None, "все методы провалились (HF + Stability + Gemini + SD)"
 
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
