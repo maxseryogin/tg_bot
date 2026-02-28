@@ -78,6 +78,7 @@ PLAYER_URL          = _config("PLAYER_URL", "http://localhost:9988")
 TOGETHER_API_TOKEN  = _config("TOGETHER_API_TOKEN", "")
 GEMINI_API_KEY      = _config("GEMINI_API_KEY", "")
 REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
+MUKESH_API_KEY      = _config("MUKESH_API_KEY", "")
 TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
 
 logging.basicConfig(
@@ -435,21 +436,15 @@ HF_MODELS = [
 ]
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 
-# ── Лимит картинок на чат ─────────────────────────────────────────────────────
-DRAW_TRIGGER    = "жужа нарисуй"
-DRAW_COOLDOWN_SEC = 60
-_draw_chat_timestamps: dict[int, float] = {}  # chat_id → последний timestamp
-DRAW_CHAT_WINDOW = 60.0
+# ── Очередь картинок на чат (1 генерация + 40 сек между) ─────────────────────
+DRAW_TRIGGER      = "жужа нарисуй"
+DRAW_COOLDOWN_SEC = 40          # минимум между генерациями в чате
+_draw_cooldowns: dict[int, float] = {}  # переопределяем: теперь это per-chat
 
-
-def _draw_chat_check_and_record(chat_id: int) -> tuple:
-    now  = time.time()
-    last = _draw_chat_timestamps.get(chat_id, 0)
-    if now - last < DRAW_CHAT_WINDOW:
-        wait = int(DRAW_CHAT_WINDOW - (now - last)) + 1
-        return False, wait
-    _draw_chat_timestamps[chat_id] = now
-    return True, 0
+# Очереди: chat_id → asyncio.Queue с элементами (message, prompt_raw, prompt_en)
+_draw_queues:     dict[int, asyncio.Queue]  = {}
+_draw_queue_busy: dict[int, bool]           = {}
+_draw_last_done:  dict[int, float]          = {}   # время завершения последней генерации
 
 
 # ── Генерация изображений ─────────────────────────────────────────────────────
@@ -538,281 +533,60 @@ async def generate_image_local(prompt: str) -> tuple:
 
 
 async def generate_image_g4f(prompt: str) -> tuple:
-    """Генерация через g4f (gpt4free) — FLUX, бесплатно."""
+    """Генерация через g4f — перебирает модели/провайдеров пока не получит картинку."""
     import aiohttp
     try:
         from g4f.client import Client as G4FClient
     except ImportError:
         return None, "g4f не установлен (pip install g4f)"
-    try:
-        loop = asyncio.get_event_loop()
 
-        def _gen():
-            client = G4FClient()
-            response = client.images.generate(model="flux", prompt=prompt, response_format="url")
-            return response.data[0].url
-
-        img_url = await loop.run_in_executor(None, _gen)
-        if not img_url:
-            return None, "g4f: пустой URL"
-        logger.info("g4f FLUX: получен URL, скачиваем...")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status == 200:
-                    image_bytes = await resp.read()
-                    if len(image_bytes) > 1000:
-                        logger.info("g4f FLUX: ✓ %dKB", len(image_bytes) // 1024)
-                        return image_bytes, None
-                return None, f"g4f: не удалось скачать картинку (HTTP {resp.status})"
-    except Exception as e:
-        logger.warning("g4f exception: %s", e)
-        return None, f"g4f: {str(e)[:100]}"
-
-
-async def generate_image_gemini(prompt: str) -> tuple:
-    import aiohttp, base64 as _b64
-    if not GEMINI_API_KEY:
-        return None, "GEMINI_API_KEY не задан"
-    GEMINI_IMAGE_MODELS = [
-        "gemini-2.0-flash-exp-image-generation",
-        "gemini-2.0-flash-preview-image-generation",
-        "gemini-2.0-flash",
+    # Провайдеры и модели для перебора по очереди
+    attempts = [
+        {"model": "flux"},
+        {"model": "flux-pro"},
+        {"model": "flux-schnell"},
+        {"model": "flux-dev"},
+        {"model": "dall-e-3"},
+        {"model": "midjourney"},
+        {"model": "sdxl"},
+        {"model": "sd-3"},
     ]
-    payload = {
-        "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
-        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
-    }
-    last_err = "все модели недоступны"
-    try:
-        async with aiohttp.ClientSession() as session:
-            for model in GEMINI_IMAGE_MODELS:
-                url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-                       f"{model}:generateContent?key={GEMINI_API_KEY}")
-                try:
-                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                        data = await resp.json()
-                        if resp.status != 200:
-                            err = data.get("error", {}).get("message", str(resp.status))
-                            last_err = f"{model}: {err[:80]}"
-                            continue
-                        for candidate in data.get("candidates", []):
-                            for part in candidate.get("content", {}).get("parts", []):
-                                b64 = part.get("inlineData", {}).get("data", "")
-                                if b64:
-                                    image_bytes = _b64.b64decode(b64)
-                                    logger.info("Gemini[%s]: ✓ %dKB", model, len(image_bytes) // 1024)
-                                    return image_bytes, None
-                        last_err = f"{model}: нет картинки в ответе"
-                except asyncio.TimeoutError:
-                    last_err = f"{model}: таймаут"
-                except Exception as e:
-                    last_err = f"{model}: {str(e)[:60]}"
-        return None, f"Gemini: {last_err}"
-    except Exception as e:
-        return None, str(e)[:100]
 
+    loop = asyncio.get_event_loop()
 
-async def generate_image_together(prompt: str) -> tuple:
-    import aiohttp
-    if not TOGETHER_API_TOKEN:
-        return None, "TOGETHER_API_TOKEN не задан"
-    headers = {"Authorization": f"Bearer {TOGETHER_API_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "model": "black-forest-labs/FLUX.1-schnell-Free",
-        "prompt": prompt, "width": 1024, "height": 1024, "steps": 4, "n": 1,
-        "response_format": "b64_json",
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(TOGETHER_URL, headers=headers, json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    b64  = (data.get("data") or [{}])[0].get("b64_json", "")
-                    if b64:
-                        import base64 as _b64
-                        image_bytes = _b64.b64decode(b64)
-                        logger.info("Together AI: ✓ %dKB", len(image_bytes) // 1024)
-                        return image_bytes, None
-                    return None, "Together AI: пустой b64_json"
-                return None, f"Together AI: HTTP {resp.status}"
-    except asyncio.TimeoutError:
-        return None, "Together AI: таймаут"
-    except Exception as e:
-        return None, str(e)[:100]
-
-
-async def generate_image_replicate(prompt: str, width: int = 1024, height: int = 1024) -> tuple:
-    if not REPLICATE_API_TOKEN:
-        return None, "REPLICATE_API_TOKEN не задан"
-    import aiohttp
-    headers = {"Authorization": f"Token {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "version": "39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
-        "input": {"prompt": prompt, "width": width, "height": height,
-                  "num_inference_steps": 30, "guidance_scale": 7.5},
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://api.replicate.com/v1/predictions",
-                                    json=payload, headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status not in (200, 201):
-                    return None, f"Replicate: ошибка {resp.status}"
-                data = await resp.json()
-                prediction_id = data.get("id")
-                if not prediction_id:
-                    return None, "Replicate: не получен prediction ID"
-            poll_url = f"https://api.replicate.com/v1/predictions/{prediction_id}"
-            for _ in range(40):
-                await asyncio.sleep(3)
-                async with session.get(poll_url, headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=10)) as chk:
-                    if chk.status != 200:
-                        continue
-                    chk_data = await chk.json()
-                    status   = chk_data.get("status")
-                    if status == "succeeded":
-                        output  = chk_data.get("output")
-                        img_url = output[0] if isinstance(output, list) and output else output
-                        if not img_url:
-                            return None, "Replicate: пустой output"
-                        async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=20)) as img_resp:
-                            if img_resp.status == 200:
-                                return await img_resp.read(), None
-                        return None, "Replicate: не удалось скачать"
-                    elif status in ("failed", "canceled"):
-                        return None, f"Replicate: {chk_data.get('error') or 'ошибка'}"
-            return None, "Replicate: таймаут"
-    except Exception as e:
-        return None, str(e)[:100]
-
-
-async def generate_image_stable_horde(prompt: str) -> tuple:
-    import aiohttp
-    api_key = _config("STABLE_HORDE_TOKEN", "0000000000")
-    base    = "https://stablehorde.net/api/v2"
-    payload = {
-        "prompt": prompt,
-        "params": {"sampler_name": "k_euler_a", "cfg_scale": 7, "steps": 25,
-                   "width": 1024, "height": 1024, "n": 1},
-        "models": ["Deliberate"], "r2": True, "shared": False,
-    }
-    headers = {"apikey": api_key, "Content-Type": "application/json", "Client-Agent": "telegram_bot:1.0"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{base}/generate/async", json=payload, headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status not in (200, 202):
-                    return None, None
-                data   = await resp.json()
-                job_id = data.get("id")
-                if not job_id:
-                    return None, None
-            for _ in range(40):
-                await asyncio.sleep(3)
-                try:
-                    async with session.get(f"{base}/generate/check/{job_id}", headers=headers,
-                                           timeout=aiohttp.ClientTimeout(total=10)) as chk:
-                        if chk.status != 200:
-                            continue
-                        chk_data = await chk.json()
-                        if chk_data.get("faulted"):
-                            return None, None
-                        if not chk_data.get("done"):
-                            continue
-                except Exception:
-                    continue
-                async with session.get(f"{base}/generate/status/{job_id}", headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=15)) as res:
-                    if res.status != 200:
-                        return None, None
-                    res_data    = await res.json()
-                    generations = res_data.get("generations", [])
-                    if not generations:
-                        return None, None
-                    img_url = generations[0].get("img")
-                    if not img_url:
-                        return None, None
-                    async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=20)) as img_resp:
-                        if img_resp.status == 200:
-                            image_bytes = await img_resp.read()
-                            if len(image_bytes) > 1000:
-                                logger.info("✓ Stable Horde")
-                                return image_bytes, None
-            return None, None
-    except Exception as e:
-        logger.warning("Stable Horde exception: %s", e)
-        return None, None
-
-
-async def generate_image_pollinations(prompt: str) -> tuple:
-    import aiohttp, urllib.parse
-    last_error = "все сервисы недоступны"
-    encoded    = urllib.parse.quote(prompt)
-    seed       = random.randint(1, 999999)
-    hdrs = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer":    "https://pollinations.ai/",
-    }
-    for model in ("flux", "flux-schnell", "turbo"):
-        url = (f"https://image.pollinations.ai/prompt/{encoded}"
-               f"?model={model}&width=1024&height=1024&nologo=true&seed={seed}")
+    for attempt in attempts:
+        model = attempt["model"]
         try:
-            logger.info("Pollinations model=%s...", model)
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(url, headers=hdrs, timeout=aiohttp.ClientTimeout(total=90),
-                                    allow_redirects=True) as r:
-                    if r.status == 200:
-                        ct = r.headers.get("Content-Type", "")
-                        if "image" in ct or "octet" in ct:
-                            data = await r.read()
-                            if len(data) > 5000:
-                                logger.info("✓ Pollinations %s", model)
-                                return data, None
-                    last_error = f"Pollinations/{model}: HTTP {r.status}"
-                    if r.status == 530:
-                        break
+            def _gen(m=model):
+                client = G4FClient()
+                resp = client.images.generate(model=m, prompt=prompt, response_format="url")
+                return resp.data[0].url if resp.data else None
+
+            logger.info("g4f: пробуем model=%s...", model)
+            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen), timeout=90)
+            if not img_url:
+                logger.warning("g4f [%s]: пустой URL", model)
+                continue
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status == 200:
+                        image_bytes = await resp.read()
+                        if len(image_bytes) > 1000:
+                            logger.info("g4f [%s]: ✓ %dKB", model, len(image_bytes) // 1024)
+                            return image_bytes, None
+                    logger.warning("g4f [%s]: скачивание HTTP %d", model, resp.status)
+
         except asyncio.TimeoutError:
-            last_error = f"Pollinations/{model}: timeout"
+            logger.warning("g4f [%s]: таймаут", model)
         except Exception as e:
-            last_error = str(e)[:60]
+            logger.warning("g4f [%s]: %s", model, str(e)[:120])
 
-    try:
-        result = await generate_image_stable_horde(prompt)
-        if result[0]:
-            return result
-        last_error = "Stable Horde: нет воркеров"
-    except Exception as e:
-        last_error = str(e)[:60]
-
-    return None, f"❌ Генерация недоступна: {last_error}"
+    return None, "g4f: все модели не дали результат"
 
 
-async def generate_image_huggingface(prompt: str) -> tuple:
-    import aiohttp
-    if not HUGGINGFACE_TOKEN:
-        return None, "HF token не задан"
-    headers = {
-        "Authorization": f"Bearer {HUGGINGFACE_TOKEN}",
-        "Accept":        "image/png",
-        "Content-Type":  "application/json",
-    }
-    payload = {"inputs": prompt, "parameters": {"num_inference_steps": 25}}
-    for model in HF_MODELS:
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post(HF_API_URL.format(model), headers=headers, json=payload,
-                                     timeout=aiohttp.ClientTimeout(total=120)) as r:
-                    if r.status == 200:
-                        return await r.read(), None
-                    if r.status == 402:
-                        return None, "❌ HF: кредиты кончились (402)"
-                    if r.status in (401, 403):
-                        return None, "❌ HF: неверный токен"
-        except Exception as e:
-            logger.warning("HF exception: %s", e)
-    return None, "❌ HuggingFace недоступен"
+# ── Скачивание музыки ─────────────────────────────────────────────────────────
+
 
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
@@ -1689,6 +1463,93 @@ def _start_ngrok(domain: str):
     logger.info("ngrok запущен в фоне → https://%s", domain)
 
 
+# ── Воркер очереди рисования ──────────────────────────────────────────────────
+
+async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
+    """Генерирует картинку через g4f, перебирая модели."""
+    prompt_en = await translate_prompt_to_english(prompt_raw)
+    logger.info("Draw: '%s' → '%s'", prompt_raw, prompt_en)
+    image_bytes, error_str = await generate_image_g4f(prompt_en)
+    if image_bytes:
+        return image_bytes, prompt_raw
+    logger.warning("Draw: g4f: %s", error_str)
+    return None, error_str
+
+
+async def _draw_queue_worker(chat_id: int, bot):
+    """
+    Воркер очереди рисования для одного чата.
+    Правила:
+      - одновременно 1 генерация на чат
+      - после завершения ждём 40 секунд с момента старта генерации,
+        потом берём следующего из очереди
+    """
+    from aiogram.types import BufferedInputFile
+
+    _draw_queue_busy[chat_id] = True
+    queue = _draw_queues[chat_id]
+
+    try:
+        while not queue.empty():
+            message, prompt_raw = await queue.get()
+            queue_size = queue.qsize()
+
+            start_time = time.time()
+
+            # Ждём, если с прошлой генерации не прошло 40 сек
+            last_done = _draw_last_done.get(chat_id, 0)
+            gap = time.time() - last_done
+            if gap < DRAW_COOLDOWN_SEC:
+                wait = DRAW_COOLDOWN_SEC - gap
+                logger.info("Draw queue [chat %s]: ждём %.1f сек между генерациями", chat_id, wait)
+                await asyncio.sleep(wait)
+
+            status_msg = await message.reply("🎨 Рисую, подожди (~30-60 сек)...")
+            try:
+                image_bytes, result_info = await _do_generate_image(prompt_raw)
+                _draw_last_done[chat_id] = time.time()
+
+                if not image_bytes:
+                    await status_msg.edit_text(f"😔 Не получилось нарисовать: {result_info}")
+                else:
+                    photo = BufferedInputFile(image_bytes, filename="draw.png")
+                    await message.reply_photo(
+                        photo=photo,
+                        caption=f"🎨 <b>{prompt_raw}</b>",
+                        parse_mode="HTML",
+                    )
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+
+                # Если в очереди ещё есть — предупредим следующего
+                if not queue.empty():
+                    elapsed = time.time() - start_time
+                    wait_left = max(0, DRAW_COOLDOWN_SEC - elapsed)
+                    if wait_left > 1:
+                        try:
+                            next_msg, _ = queue.queue[0]  # peek
+                            await next_msg.reply(
+                                f"⏳ Скоро твоя очередь! Старт через ~{int(wait_left)} сек.",
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.exception("Draw queue worker error: %s", e)
+                _draw_last_done[chat_id] = time.time()
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                except Exception:
+                    pass
+            finally:
+                queue.task_done()
+    finally:
+        _draw_queue_busy[chat_id] = False
+
+
 # ── Основной цикл бота ────────────────────────────────────────────────────────
 
 async def run_bot(backend=None):
@@ -1985,21 +1846,6 @@ async def run_bot(backend=None):
 
         if DRAW_TRIGGER.lower() in text:
             chat_id = message.chat.id
-            now     = time.time()
-
-            last = _draw_cooldowns.get(user_id, 0)
-            if now - last < DRAW_COOLDOWN_SEC:
-                remain = int(DRAW_COOLDOWN_SEC - (now - last))
-                await message.reply(f"⏱️ Подожди ещё {remain} сек.")
-                return
-
-            can_draw, wait_sec = _draw_chat_check_and_record(chat_id)
-            if not can_draw:
-                await message.reply(
-                    f"🚫 В этом чате уже нарисовали {DRAW_CHAT_LIMIT} картинки за минуту. "
-                    f"Подождите ещё {wait_sec} сек."
-                )
-                return
 
             raw        = message.text or ""
             idx        = raw.lower().find(DRAW_TRIGGER.lower())
@@ -2010,83 +1856,35 @@ async def run_bot(backend=None):
                     "Напиши что нарисовать, например:\n<i>жужа нарисуй закат на море</i>",
                     parse_mode="HTML",
                 )
-                _draw_chat_timestamps.pop(chat_id, None)
                 return
             if len(prompt_raw) > 300:
                 await message.reply("❌ Промпт слишком длинный (макс 300 символов)")
-                _draw_chat_timestamps.pop(chat_id, None)
                 return
 
-            _draw_cooldowns[user_id] = now
-            status_msg = await message.reply("🎨 Рисую, подожди (~30-60 сек)...")
+            # Инициализируем очередь для чата
+            if chat_id not in _draw_queues:
+                _draw_queues[chat_id]     = asyncio.Queue()
+                _draw_queue_busy[chat_id] = False
 
-            try:
-                from aiogram.types import BufferedInputFile
-                prompt_en  = await translate_prompt_to_english(prompt_raw)
-                logger.info("Draw: '%s' → '%s'", prompt_raw, prompt_en)
+            queue = _draw_queues[chat_id]
+            pos   = queue.qsize()
 
-                image_bytes = None
-                error_str   = "все сервисы недоступны"
+            if pos >= 5:
+                await message.reply("🚫 Очередь переполнена (макс 5). Попробуй позже.")
+                return
 
-                logger.info("Draw: пробуем g4f FLUX...")
-                image_bytes, error_str = await generate_image_g4f(prompt_en)
-                if image_bytes:
-                    logger.info("Draw: ✓ g4f FLUX")
-                else:
-                    logger.warning("Draw: g4f: %s", error_str)
-
-                if not image_bytes and GEMINI_API_KEY:
-                    logger.info("Draw: пробуем Gemini...")
-                    image_bytes, error_str = await generate_image_gemini(prompt_en)
-                    if image_bytes:
-                        logger.info("Draw: ✓ Gemini")
-                    else:
-                        logger.warning("Draw: Gemini: %s", error_str)
-
-                if not image_bytes and TOGETHER_API_TOKEN:
-                    logger.info("Draw: пробуем Together AI...")
-                    image_bytes, error_str = await generate_image_together(prompt_en)
-                    if image_bytes:
-                        logger.info("Draw: ✓ Together AI")
-                    else:
-                        logger.warning("Draw: Together AI: %s", error_str)
-
-                if not image_bytes and REPLICATE_API_TOKEN:
-                    logger.info("Draw: пробуем Replicate...")
-                    image_bytes, error_str = await generate_image_replicate(prompt_en)
-                    if image_bytes:
-                        logger.info("Draw: ✓ Replicate")
-                    else:
-                        logger.warning("Draw: Replicate: %s", error_str)
-
-                if not image_bytes:
-                    logger.info("Draw: пробуем Pollinations...")
-                    image_bytes, error_str = await generate_image_pollinations(prompt_en)
-                    if image_bytes:
-                        logger.info("Draw: ✓ Pollinations")
-                    else:
-                        logger.warning("Draw: Pollinations: %s", error_str)
-
-                if not image_bytes:
-                    await status_msg.edit_text(f"😔 Не получилось нарисовать: {error_str}")
-                    return
-
-                photo = BufferedInputFile(image_bytes, filename="draw.png")
-                await message.reply_photo(
-                    photo=photo,
-                    caption=f"🎨 <b>{prompt_raw}</b>",
+            # Сообщаем пользователю его позицию в очереди
+            if _draw_queue_busy[chat_id] or pos > 0:
+                await message.reply(
+                    f"⏳ Ты в очереди — позиция <b>{pos + 1}</b>. Скоро нарисую!",
                     parse_mode="HTML",
                 )
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.exception("Ошибка генерации картинки: %s", e)
-                try:
-                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
-                except Exception:
-                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+
+            await queue.put((message, prompt_raw))
+
+            # Запускаем worker если не запущен
+            if not _draw_queue_busy[chat_id]:
+                asyncio.create_task(_draw_queue_worker(chat_id, bot))
             return
 
         if SEARCH_TRIGGER.lower() in text:
@@ -2139,7 +1937,7 @@ async def run_bot(backend=None):
         uname    = (user_obj.username or "") if user_obj else ""
         chat_id  = message.chat.id
 
-        if _trigger_matches(text):
+        if _trigger_matches(text) and user_id == ALLOWED_USER_ID:
             be = get_backend()
             await cmd_trigger(message, bot, be)
             return
@@ -2162,7 +1960,7 @@ async def run_bot(backend=None):
                 await message.reply("молчу 🤐")
             return
 
-        if CHAT_TEST_TRIGGER.lower() in text:
+        if CHAT_TEST_TRIGGER.lower() in text and _chat_mode_enabled.get(chat_id):
             sender_name = (user_obj.first_name or uname or "кто-то") if user_obj else "кто-то"
             reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
             await message.reply(reply_text if reply_text else "тут, но что-то пошло не так 😔")
@@ -2188,11 +1986,12 @@ async def run_bot(backend=None):
 
     logger.info("Бот запущен")
     logger.info(
-        "Токены: GEMINI=%s | TOGETHER=%s | REPLICATE=%s | HF=%s",
+        "Токены: GEMINI=%s | TOGETHER=%s | REPLICATE=%s | HF=%s | MUKESH=%s",
         "✓" if GEMINI_API_KEY      else "✗",
         "✓" if TOGETHER_API_TOKEN  else "✗",
         "✓" if REPLICATE_API_TOKEN else "✗",
         "✓" if HUGGINGFACE_TOKEN   else "✗",
+        "✓" if MUKESH_API_KEY      else "✗",
     )
     await dp.start_polling(bot)
 
