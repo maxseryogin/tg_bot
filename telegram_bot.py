@@ -676,6 +676,114 @@ async def _download_image_url(url: str) -> bytes | None:
         logger.warning("_download_image_url: %s", str(e)[:80])
     return None
 
+# ── Генерация через Perchance / Olike-AI ─────────────────────────────────────
+
+# Olike-AI — Perchance-hosted AI art generator (https://perchance.org/olike-ai)
+# Поддерживает три режима: pollen (качество), buzz (скорость), fresh (стиль)
+_PERCHANCE_MODES = ["pollen", "buzz", "fresh"]
+
+async def generate_image_perchance(prompt: str, mode: str = "pollen") -> tuple:
+    """
+    Генерация картинки через Perchance olike-ai.
+    mode: 'pollen' | 'buzz' | 'fresh'
+    Возвращает (bytes, None) при успехе или (None, error_str) при ошибке.
+    """
+    import aiohttp, urllib.parse
+
+    if mode not in _PERCHANCE_MODES:
+        mode = "pollen"
+
+    # olike-ai использует Perchance API для генерации
+    # Базовый URL API Perchance для AI-генерации
+    base_url = "https://image-generation.perchance.org/api/generate"
+
+    params = {
+        "prompt":       prompt,
+        "negativePrompt": "ugly, blurry, deformed, watermark, text, nsfw, lowres",
+        "resolution":   "512x512",
+        "guidanceScale": "7",
+        "seed":         str(random.randint(1, 2**31)),
+        "__metadata__": f"olike-ai-{mode}",
+    }
+
+    # Подбираем channel (стиль) по режиму
+    _mode_channels = {
+        "pollen": "olike-pollen",
+        "buzz":   "olike-buzz",
+        "fresh":  "olike-fresh",
+    }
+    params["channel"] = _mode_channels.get(mode, "olike-pollen")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer":    "https://perchance.org/olike-ai",
+        "Origin":     "https://perchance.org",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            logger.info("Perchance/olike-%s: генерируем...", mode)
+            async with session.get(
+                base_url, params=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=90),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Perchance HTTP %d", resp.status)
+                    return None, f"Perchance HTTP {resp.status}"
+
+                ct = resp.headers.get("Content-Type", "")
+                if "image" in ct:
+                    data = await resp.read()
+                    if len(data) > 2000:
+                        logger.info("Perchance/olike-%s ✓ %dKB", mode, len(data)//1024)
+                        return data, None
+                    return None, "Perchance: слишком маленький ответ"
+
+                # JSON ответ с URL или base64
+                try:
+                    j = await resp.json(content_type=None)
+                except Exception:
+                    text_resp = await resp.text()
+                    # попробуем найти base64 внутри
+                    if "base64" in text_resp or text_resp.startswith("data:"):
+                        img = await _download_image_url(text_resp.strip())
+                        if img:
+                            return img, None
+                    return None, f"Perchance: неожиданный ответ ({text_resp[:80]})"
+
+                img_url = (
+                    j.get("imageUrl") or j.get("url") or j.get("image") or
+                    j.get("data", {}).get("url") if isinstance(j.get("data"), dict) else None
+                )
+                if img_url:
+                    img_bytes = await _download_image_url(img_url)
+                    if img_bytes:
+                        logger.info("Perchance/olike-%s (URL) ✓ %dKB", mode, len(img_bytes)//1024)
+                        return img_bytes, None
+                return None, f"Perchance: нет URL в ответе ({str(j)[:120]})"
+
+    except asyncio.TimeoutError:
+        logger.warning("Perchance/olike-%s: таймаут", mode)
+        return None, "Perchance: таймаут"
+    except Exception as e:
+        logger.warning("Perchance/olike-%s: %s", mode, str(e)[:100])
+        return None, f"Perchance: {str(e)[:80]}"
+
+
+async def generate_image_perchance_all_modes(prompt: str) -> tuple:
+    """
+    Пробует все три режима Perchance (pollen → buzz → fresh).
+    Возвращает первый успешный результат.
+    """
+    for mode in _PERCHANCE_MODES:
+        img_bytes, err = await generate_image_perchance(prompt, mode)
+        if img_bytes:
+            return img_bytes, None
+        logger.warning("Perchance/%s не сработал: %s", mode, err)
+        await asyncio.sleep(random.uniform(2, 4))
+    return None, "Perchance: все режимы (pollen/buzz/fresh) недоступны"
+
+
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
 
 
@@ -1640,6 +1748,15 @@ async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
     prompt_final = _enhance_prompt(prompt_en)
     logger.info("Draw: enhanced prompt len=%d for: %s", len(prompt_final), prompt_raw[:40].replace("\n", " "))
 
+    # ── [1] Perchance / Olike-AI (без квоты, 3 режима: pollen→buzz→fresh) ─────
+    logger.info("Draw [1/2]: Perchance/olike-ai...")
+    image_bytes, error_str = await generate_image_perchance_all_modes(prompt_final)
+    if image_bytes:
+        return image_bytes, prompt_raw
+    logger.warning("Draw [1/2]: Perchance не сработал: %s", error_str)
+
+    # ── [2] g4f (Blackbox → DeepInfra → HF) ────────────────────────────────
+    logger.info("Draw [2/2]: g4f fallback...")
     image_bytes, error_str = await generate_image_g4f(prompt_final)
     if image_bytes:
         return image_bytes, prompt_raw
