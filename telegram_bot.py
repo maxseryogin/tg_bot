@@ -438,7 +438,7 @@ HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 
 # ── Очередь картинок на чат (1 генерация + 40 сек между) ─────────────────────
 DRAW_TRIGGER      = "жужа нарисуй"
-DRAW_COOLDOWN_SEC = 40          # минимум между генерациями в чате
+DRAW_COOLDOWN_SEC = 35          # минимум между генерациями в чате (~1.7 карт/мин)
 _draw_cooldowns: dict[int, float] = {}  # переопределяем: теперь это per-chat
 
 # Очереди: chat_id → asyncio.Queue с элементами (message, prompt_raw, prompt_en)
@@ -532,57 +532,137 @@ async def generate_image_local(prompt: str) -> tuple:
             return None, str(e)[:100]
 
 
-async def generate_image_g4f(prompt: str) -> tuple:
-    """Генерация через g4f — перебирает модели/провайдеров пока не получит картинку."""
+async def _generate_pollinations_direct(prompt: str) -> tuple:
+    """
+    Прямой запрос к Pollinations.ai без g4f.
+    Самый надёжный бесплатный вариант — работает без ключей.
+    """
     import aiohttp
+    import urllib.parse
+
+    models = ["flux", "flux-schnell", "turbo"]
+    encoded = urllib.parse.quote(prompt)
+
+    async with aiohttp.ClientSession() as session:
+        for model in models:
+            url = f"https://image.pollinations.ai/prompt/{encoded}?model={model}&width=512&height=512&nologo=true&nofeed=true"
+            label = f"pollinations/{model}"
+            try:
+                logger.info("pollinations: пробуем %s...", label)
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=55),
+                    allow_redirects=True,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                ) as resp:
+                    if resp.status == 200:
+                        ct = resp.headers.get("Content-Type", "")
+                        if "image" in ct:
+                            data = await resp.read()
+                            if len(data) > 5000:
+                                logger.info("pollinations [%s]: ✓ %dKB", label, len(data) // 1024)
+                                return data, None
+                            logger.warning("pollinations [%s]: слишком маленький ответ %d байт", label, len(data))
+                        else:
+                            logger.warning("pollinations [%s]: Content-Type=%s", label, ct)
+                    else:
+                        logger.warning("pollinations [%s]: HTTP %d", label, resp.status)
+            except asyncio.TimeoutError:
+                logger.warning("pollinations [%s]: таймаут", label)
+            except Exception as e:
+                logger.warning("pollinations [%s]: %s", label, str(e)[:80])
+
+    return None, "pollinations: все модели не ответили"
+
+
+async def generate_image_g4f(prompt: str) -> tuple:
+    """
+    Генерация изображений:
+    1) Сначала прямой запрос к Pollinations.ai (быстро, надёжно, без ключей)
+    2) Потом g4f с рабочими провайдерами (Airforce, ImageLabs, DiffusersImage)
+    3) Потом локальный SD (если установлен diffusers)
+    """
+    import aiohttp
+
+    # ── Шаг 1: Pollinations напрямую ──────────────────────────────────────────
+    image_bytes, err = await _generate_pollinations_direct(prompt)
+    if image_bytes:
+        return image_bytes, None
+
+    # ── Шаг 2: g4f провайдеры (только рабочие без ключей) ────────────────────
     try:
         from g4f.client import Client as G4FClient
+        import g4f.Provider as Providers
     except ImportError:
-        return None, "g4f не установлен (pip install g4f)"
+        logger.info("g4f не установлен, пропускаем")
+        Providers = None
 
-    # Провайдеры и модели для перебора по очереди
-    attempts = [
-        {"model": "flux"},
-        {"model": "flux-pro"},
-        {"model": "flux-schnell"},
-        {"model": "flux-dev"},
-        {"model": "dall-e-3"},
-        {"model": "midjourney"},
-        {"model": "sdxl"},
-        {"model": "sd-3"},
-    ]
+    if Providers is not None:
+        def _prov(name):
+            return getattr(Providers, name, None)
 
-    loop = asyncio.get_event_loop()
+        # Порядок: сначала те, что реально работают
+        attempts = []
+        for name, model in [
+            ("Airforce",           "flux"),
+            ("Airforce",           "stable-diffusion-xl-lightning"),
+            ("ImageLabs",          ""),
+            ("DiffusersImage",     "black-forest-labs/FLUX.1-schnell"),
+            ("DiffusersImage",     "stabilityai/stable-diffusion-xl-base-1.0"),
+            ("DiffusersImage",     "stabilityai/stable-diffusion-3.5-large-turbo"),
+            ("HuggingFaceImage",   "black-forest-labs/FLUX.1-schnell"),
+            ("HuggingFaceImage",   "stabilityai/stable-diffusion-xl-base-1.0"),
+        ]:
+            p = _prov(name)
+            if p is not None:
+                attempts.append((p, model))
 
-    for attempt in attempts:
-        model = attempt["model"]
-        try:
-            def _gen(m=model):
-                client = G4FClient()
-                resp = client.images.generate(model=m, prompt=prompt, response_format="url")
-                return resp.data[0].url if resp.data else None
+        loop = asyncio.get_event_loop()
 
-            logger.info("g4f: пробуем model=%s...", model)
-            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen), timeout=90)
-            if not img_url:
-                logger.warning("g4f [%s]: пустой URL", model)
-                continue
+        for provider, model in attempts:
+            provider_name = getattr(provider, "__name__", str(provider))
+            label = f"{provider_name}/{model}" if model else provider_name
+            try:
+                def _gen(p=provider, m=model):
+                    client = G4FClient()
+                    kwargs = {"prompt": prompt, "provider": p, "response_format": "url"}
+                    if m:
+                        kwargs["model"] = m
+                    resp = client.images.generate(**kwargs)
+                    return resp.data[0].url if resp.data else None
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    if resp.status == 200:
-                        image_bytes = await resp.read()
-                        if len(image_bytes) > 1000:
-                            logger.info("g4f [%s]: ✓ %dKB", model, len(image_bytes) // 1024)
-                            return image_bytes, None
-                    logger.warning("g4f [%s]: скачивание HTTP %d", model, resp.status)
+                logger.info("g4f: пробуем %s...", label)
+                img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen), timeout=55)
+                if not img_url:
+                    logger.warning("g4f [%s]: пустой URL", label)
+                    continue
 
-        except asyncio.TimeoutError:
-            logger.warning("g4f [%s]: таймаут", model)
-        except Exception as e:
-            logger.warning("g4f [%s]: %s", model, str(e)[:120])
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=55)) as resp:
+                        if resp.status == 200:
+                            ct = resp.headers.get("Content-Type", "")
+                            image_bytes = await resp.read()
+                            if len(image_bytes) > 5000 and ("image" in ct or len(image_bytes) > 10000):
+                                logger.info("g4f [%s]: ✓ %dKB", label, len(image_bytes) // 1024)
+                                return image_bytes, None
+                            logger.warning("g4f [%s]: Content-Type=%s size=%d", label, ct, len(image_bytes))
+                        else:
+                            logger.warning("g4f [%s]: HTTP %d", label, resp.status)
 
-    return None, "g4f: все модели не дали результат"
+            except asyncio.TimeoutError:
+                logger.warning("g4f [%s]: таймаут", label)
+            except Exception as e:
+                err = str(e)[:120]
+                logger.warning("g4f [%s]: %s", label, err)
+
+    # ── Шаг 3: локальный SD (diffusers) ──────────────────────────────────────
+    logger.info("Пробуем локальный SD (diffusers)...")
+    image_bytes, sd_err = await generate_image_local(prompt)
+    if image_bytes:
+        return image_bytes, None
+    logger.warning("SD local: %s", sd_err)
+
+    return None, "все методы не дали результат (pollinations + g4f + SD)"
 
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
@@ -1475,13 +1555,13 @@ def _start_ngrok(domain: str):
 # ── Воркер очереди рисования ──────────────────────────────────────────────────
 
 async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
-    """Генерирует картинку через g4f, перебирая модели."""
+    """Генерирует картинку: Pollinations → g4f → локальный SD."""
     prompt_en = await translate_prompt_to_english(prompt_raw)
     logger.info("Draw: '%s' → '%s'", prompt_raw, prompt_en)
     image_bytes, error_str = await generate_image_g4f(prompt_en)
     if image_bytes:
         return image_bytes, prompt_raw
-    logger.warning("Draw: g4f: %s", error_str)
+    logger.warning("Draw: все методы провалились: %s", error_str)
     return None, error_str
 
 
