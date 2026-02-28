@@ -79,7 +79,6 @@ TOGETHER_API_TOKEN  = _config("TOGETHER_API_TOKEN", "")
 GEMINI_API_KEY      = _config("GEMINI_API_KEY", "")
 REPLICATE_API_TOKEN = _config("REPLICATE_API_TOKEN", "")
 MUKESH_API_KEY      = _config("MUKESH_API_KEY", "")
-STABILITY_API_KEY   = _config("STABILITY_API_KEY", "")
 TOGETHER_URL        = "https://api.together.xyz/v1/images/generations"
 
 logging.basicConfig(
@@ -437,15 +436,144 @@ HF_MODELS = [
 ]
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 
-# ── Очередь картинок на чат (1 генерация + 40 сек между) ─────────────────────
+# ── Очередь картинок ──────────────────────────────────────────────────────────
 DRAW_TRIGGER      = "жужа нарисуй"
-DRAW_COOLDOWN_SEC = 35          # минимум между генерациями (~1.7 карт/мин)
-_draw_cooldowns: dict[int, float] = {}  # переопределяем: теперь это per-chat
+DRAW_COOLDOWN_SEC = 55           # пауза между генерациями (глобально по всему боту)
+_draw_cooldowns: dict[int, float] = {}
 
-# Очереди: chat_id → asyncio.Queue с элементами (message, prompt_raw, prompt_en)
+# Глобальная очередь (один воркер на весь бот — ни один провайдер не получает
+# два запроса одновременно, что является главной причиной банов)
+_global_draw_queue: asyncio.Queue | None = None   # инициализируется в run_bot
+_global_draw_busy:  bool = False
+_global_draw_last_done: float = 0.0               # время конца последней генерации
+
+# Per-chat очереди остаются для позиции в очереди и удобства
 _draw_queues:     dict[int, asyncio.Queue]  = {}
 _draw_queue_busy: dict[int, bool]           = {}
-_draw_last_done:  dict[int, float]          = {}   # время завершения последней генерации
+_draw_last_done:  dict[int, float]          = {}
+
+# Антибан: кулдаун per-model (секунд) после последнего использования
+_model_last_used:    dict[str, float] = {}
+_MODEL_COOLDOWN_SEC = 120   # одну и ту же модель не дёргаем чаще раза в 2 минуты
+_model_fail_count:   dict[str, int]   = {}   # счётчик ошибок per-model
+
+# ── Умный энхансер промптов ───────────────────────────────────────────────────
+
+# Правила: (ключевые слова в промпте на английском) → (стиль-суффикс)
+_STYLE_RULES: list[tuple[set, str]] = [
+    (
+        {"portrait", "person", "girl", "boy", "woman", "man", "face", "character",
+         "model", "people"},
+        "photorealistic portrait, professional studio lighting, 85mm lens, "
+        "soft bokeh background, highly detailed skin, sharp eyes, 8k uhd, "
+        "award winning photography"
+    ),
+    (
+        {"landscape", "nature", "forest", "mountain", "sea", "ocean", "sunset",
+         "sunrise", "sky", "field", "river", "lake", "valley"},
+        "epic landscape photography, golden hour lighting, dramatic clouds, "
+        "hyper detailed, National Geographic style, 8k uhd, HDR, "
+        "volumetric light, stunning composition"
+    ),
+    (
+        {"city", "street", "urban", "building", "architecture", "night",
+         "town", "downtown", "alley"},
+        "cinematic urban photography, neon lights, rain wet reflections, "
+        "dramatic shadows, 35mm film, moody atmosphere, highly detailed, 4k"
+    ),
+    (
+        {"anime", "manga", "cartoon", "chibi", "waifu"},
+        "anime style illustration, vibrant colors, dynamic composition, "
+        "detailed linework, studio quality artwork, trending on pixiv, "
+        "beautiful dramatic lighting, cel shading"
+    ),
+    (
+        {"fantasy", "dragon", "magic", "wizard", "castle", "fairy", "elf",
+         "knight", "sword", "sorcerer", "dungeon"},
+        "epic fantasy digital art, intricate details, magical atmosphere, "
+        "cinematic lighting, artstation trending, 8k, dramatic composition, "
+        "concept art, highly detailed"
+    ),
+    (
+        {"space", "galaxy", "planet", "stars", "cosmos", "nebula", "astronaut",
+         "universe", "cosmic", "asteroid"},
+        "photorealistic space art, NASA concept style, cosmic scale, "
+        "vibrant nebula colors, ultra detailed, 8k, cinematic, "
+        "deep starfield background, atmospheric glow"
+    ),
+    (
+        {"cat", "dog", "animal", "pet", "fox", "wolf", "bird", "lion", "tiger",
+         "bear", "horse", "rabbit", "deer", "wildlife"},
+        "professional wildlife photography, razor sharp focus, natural bokeh, "
+        "100mm telephoto lens, highly detailed fur and texture, "
+        "golden hour lighting, 8k, National Geographic"
+    ),
+    (
+        {"food", "cake", "pizza", "coffee", "dish", "dessert", "meal",
+         "restaurant", "cooking", "chef"},
+        "professional food photography, soft studio diffused lighting, "
+        "shallow depth of field, high resolution, appetizing colors, "
+        "Canon 5D, 50mm macro, Michelin star presentation"
+    ),
+    (
+        {"cyberpunk", "futuristic", "robot", "sci-fi", "neon", "android",
+         "cyborg", "hologram", "mecha"},
+        "cyberpunk concept art, neon-lit streets, hyperdetailed chrome surfaces, "
+        "holographic effects, artstation trending, dark rainy atmosphere, "
+        "moody cinematic lighting, 8k"
+    ),
+    (
+        {"interior", "room", "house", "home", "bedroom", "kitchen",
+         "living room", "office", "studio"},
+        "professional architectural interior photography, wide angle lens, "
+        "soft ambient lighting, highly detailed textures, 8k, "
+        "interior design magazine quality, sharp perspective"
+    ),
+]
+
+# Минимальный суффикс качества — добавляется всегда
+_QUALITY_TAIL = "masterpiece, best quality, ultra-detailed, sharp focus, professional"
+
+# Маркеры «промпт уже прокачан»
+_ENHANCED_MARKERS = {"masterpiece", "artstation", "8k", "photorealistic",
+                     "cinematic", "ultra-detailed", "highly detailed"}
+
+
+def enhance_prompt(prompt_en: str) -> str:
+    """
+    Принимает английский промпт, возвращает улучшенную версию.
+    Автоматически определяет стиль по ключевым словам.
+    Итоговая длина ≤ 450 символов (g4f/flux лучше работают с коротким промптом).
+    """
+    lower = prompt_en.lower()
+
+    # Если уже детальный — только хвост качества
+    if sum(1 for m in _ENHANCED_MARKERS if m in lower) >= 2:
+        result = f"{prompt_en}, {_QUALITY_TAIL}"
+        return result[:450]
+
+    # Ищем лучший стиль
+    best_suffix = ""
+    best_score  = 0
+    for keywords, suffix in _STYLE_RULES:
+        score = sum(1 for kw in keywords if kw in lower)
+        if score > best_score:
+            best_score  = score
+            best_suffix = suffix
+
+    if not best_suffix:
+        # Универсальный fallback
+        best_suffix = (
+            "highly detailed digital illustration, "
+            "cinematic dramatic lighting, trending on artstation, "
+            "concept art, professional quality, vivid colors"
+        )
+
+    result = f"{prompt_en}, {best_suffix}, {_QUALITY_TAIL}"
+    # Обрезаем до 450 символов, не разрывая слова
+    if len(result) > 450:
+        result = result[:450].rsplit(",", 1)[0]
+    return result
 
 
 # ── Генерация изображений ─────────────────────────────────────────────────────
@@ -533,178 +661,109 @@ async def generate_image_local(prompt: str) -> tuple:
             return None, str(e)[:100]
 
 
-async def _generate_hf_image(prompt: str) -> tuple:
-    """
-    HuggingFace router.huggingface.co (новый эндпоинт с 2025).
-    api-inference.huggingface.co задеприкейтили — теперь router.huggingface.co.
-    """
-    if not HUGGINGFACE_TOKEN:
-        return None, "HUGGINGFACE_TOKEN не задан"
-    import aiohttp
-
-    models = [
-        "black-forest-labs/FLUX.1-schnell",
-        "stabilityai/stable-diffusion-xl-base-1.0",
-        "runwayml/stable-diffusion-v1-5",
-    ]
-    headers = {"Authorization": f"Bearer {HUGGINGFACE_TOKEN}"}
-
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for model in models:
-            url = f"https://router.huggingface.co/hf-inference/models/{model}"
-            label = f"hf/{model.split('/')[-1]}"
-            try:
-                logger.info("hf: пробуем %s...", label)
-                async with session.post(
-                    url,
-                    json={"inputs": prompt, "parameters": {"num_inference_steps": 4}},
-                    timeout=aiohttp.ClientTimeout(total=70),
-                ) as resp:
-                    if resp.status == 503:
-                        data = await resp.json(content_type=None)
-                        wait = min(data.get("estimated_time", 20), 30)
-                        logger.info("hf [%s]: модель грузится, ждём %ds...", label, wait)
-                        await asyncio.sleep(wait)
-                        async with session.post(
-                            url,
-                            json={"inputs": prompt, "parameters": {"num_inference_steps": 4}},
-                            timeout=aiohttp.ClientTimeout(total=70),
-                        ) as resp2:
-                            if resp2.status == 200:
-                                img_bytes = await resp2.read()
-                                if len(img_bytes) > 5000:
-                                    logger.info("hf [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
-                                    return img_bytes, None
-                        continue
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning("hf [%s]: HTTP %d: %s", label, resp.status, body[:100])
-                        continue
-                    img_bytes = await resp.read()
-                    ct = resp.headers.get("Content-Type", "")
-                    if len(img_bytes) > 5000 and ("image" in ct or len(img_bytes) > 10000):
-                        logger.info("hf [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
-                        return img_bytes, None
-                    logger.warning("hf [%s]: ct=%s size=%d", label, ct, len(img_bytes))
-            except asyncio.TimeoutError:
-                logger.warning("hf [%s]: таймаут", label)
-            except Exception as e:
-                logger.warning("hf [%s]: %s", label, str(e)[:80])
-
-    return None, "hf: все модели не ответили"
-
-
-async def _generate_stability_image(prompt: str) -> tuple:
-    """
-    Stability AI API — у тебя есть ключ STABILITY_API_KEY в Railway.
-    Модель: stable-image/generate/ultra (или core как фолбэк).
-    """
-    if not STABILITY_API_KEY:
-        return None, "STABILITY_API_KEY не задан"
-    import aiohttp
-
-    endpoints = [
-        ("https://api.stability.ai/v2beta/stable-image/generate/ultra", "ultra"),
-        ("https://api.stability.ai/v2beta/stable-image/generate/core",  "core"),
-    ]
-    headers = {
-        "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",
-    }
-
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for url, label in endpoints:
-            try:
-                logger.info("stability: пробуем %s...", label)
-                form = aiohttp.FormData()
-                form.add_field("prompt", prompt)
-                form.add_field("output_format", "png")
-                async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    if resp.status == 200:
-                        img_bytes = await resp.read()
-                        if len(img_bytes) > 5000:
-                            logger.info("stability [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
-                            return img_bytes, None
-                    body = await resp.text() if resp.status != 200 else ""
-                    logger.warning("stability [%s]: HTTP %d %s", label, resp.status, body[:80])
-            except asyncio.TimeoutError:
-                logger.warning("stability [%s]: таймаут", label)
-            except Exception as e:
-                logger.warning("stability [%s]: %s", label, str(e)[:80])
-
-    return None, "stability: все эндпоинты не ответили"
-
-
-async def _generate_gemini_image(prompt: str) -> tuple:
-    """Gemini 2.0 Flash image generation — 15 RPM бесплатно."""
-    if not GEMINI_API_KEY:
-        return None, "GEMINI_API_KEY не задан"
-    import aiohttp, base64, json as _json
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.0-flash-exp-image-generation:generateContent"
-        f"?key={GEMINI_API_KEY}"
-    )
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                body = await resp.read()
-                if resp.status == 429:
-                    return None, "gemini: rate-limit (429)"
-                if resp.status != 200:
-                    return None, f"gemini: HTTP {resp.status}: {body[:100].decode(errors='replace')}"
-                data = _json.loads(body)
-                for part in (data.get("candidates") or [{}])[0].get("content", {}).get("parts", []):
-                    inline = part.get("inlineData") or part.get("inline_data")
-                    if inline and inline.get("data"):
-                        img_bytes = base64.b64decode(inline["data"])
-                        logger.info("gemini: ✓ %dKB", len(img_bytes) // 1024)
-                        return img_bytes, None
-                return None, "gemini: картинка не найдена в ответе"
-    except asyncio.TimeoutError:
-        return None, "gemini: таймаут"
-    except Exception as e:
-        return None, f"gemini: {str(e)[:100]}"
-
-
 async def generate_image_g4f(prompt: str) -> tuple:
     """
-    Генерация изображений. Порядок:
-      1. HuggingFace (router.huggingface.co) — FLUX.1-schnell, HF токен есть
-      2. Stability AI — ключ есть в Railway (STABILITY_API_KEY)
-      3. Gemini 2.0 Flash — бесплатно 15 RPM
-      4. Локальный SD — если установлен diffusers
+    Генерация через g4f с антибан-защитой:
+    - модели перебираются в порядке приоритета
+    - каждая модель используется не чаще раза в _MODEL_COOLDOWN_SEC секунд
+    - при превышении ошибок модель временно выключается на 10 минут
+    - между попытками случайная пауза 3-8 сек (имитация живого юзера)
     """
-    logger.info("Draw: пробуем HuggingFace...")
-    img, err = await _generate_hf_image(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: HF: %s", err)
+    import aiohttp
+    try:
+        from g4f.client import Client as G4FClient
+    except ImportError:
+        return None, "g4f не установлен (pip install g4f)"
 
-    logger.info("Draw: пробуем Stability AI...")
-    img, err = await _generate_stability_image(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: Stability: %s", err)
+    # Приоритетный список моделей
+    # flux/flux-schnell — самые стабильные бесплатные
+    ALL_MODELS = [
+        "flux",
+        "flux-schnell",
+        "flux-dev",
+        "sdxl",
+        "sd-3",
+        "dall-e-3",
+        "flux-pro",
+        "midjourney",
+    ]
 
-    logger.info("Draw: пробуем Gemini...")
-    img, err = await _generate_gemini_image(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: Gemini: %s", err)
+    now = time.time()
 
-    logger.info("Draw: пробуем локальный SD...")
-    img, err = await generate_image_local(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: SD: %s", err)
+    # Фильтруем модели по кулдауну и количеству ошибок
+    def _model_available(m: str) -> bool:
+        last_used  = _model_last_used.get(m, 0)
+        fail_count = _model_fail_count.get(m, 0)
+        # Если много ошибок — даём остыть дольше
+        cooldown = _MODEL_COOLDOWN_SEC + (fail_count * 60)
+        return (now - last_used) >= cooldown
 
-    return None, "все методы провалились (HF + Stability + Gemini + SD)"
+    models_to_try = [m for m in ALL_MODELS if _model_available(m)]
+
+    # Если все на кулдауне — берём ту, что остыла дольше всего
+    if not models_to_try:
+        models_to_try = sorted(ALL_MODELS, key=lambda m: _model_last_used.get(m, 0))[:3]
+        logger.warning("g4f: все модели на кулдауне, берём самые старые: %s", models_to_try)
+
+    loop = asyncio.get_event_loop()
+
+    for model in models_to_try:
+        try:
+            def _gen(m=model, p=prompt):
+                client = G4FClient()
+                resp = client.images.generate(model=m, prompt=p, response_format="url")
+                return resp.data[0].url if resp.data else None
+
+            logger.info("g4f: пробуем model=%s (fail=%d)...", model, _model_fail_count.get(model, 0))
+            _model_last_used[model] = time.time()
+
+            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen), timeout=100)
+
+            if not img_url:
+                logger.warning("g4f [%s]: пустой URL", model)
+                _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
+                # Пауза между попытками (антибан)
+                await asyncio.sleep(random.uniform(4, 9))
+                continue
+
+            # Скачиваем картинку
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    img_url,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                ) as resp:
+                    if resp.status == 200:
+                        image_bytes = await resp.read()
+                        if len(image_bytes) > 1000:
+                            logger.info("g4f [%s]: ✓ %dKB", model, len(image_bytes) // 1024)
+                            # Сбрасываем счётчик ошибок при успехе
+                            _model_fail_count[model] = 0
+                            return image_bytes, None
+                        else:
+                            logger.warning("g4f [%s]: файл слишком мал (%d байт)", model, len(image_bytes))
+                    else:
+                        logger.warning("g4f [%s]: скачивание HTTP %d", model, resp.status)
+
+            _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
+            await asyncio.sleep(random.uniform(4, 9))
+
+        except asyncio.TimeoutError:
+            logger.warning("g4f [%s]: таймаут", model)
+            _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
+            await asyncio.sleep(random.uniform(3, 7))
+        except Exception as e:
+            err = str(e)[:120]
+            logger.warning("g4f [%s]: %s", model, err)
+            _model_fail_count[model] = _model_fail_count.get(model, 0) + 1
+            # Если явный рейт-лимит — ждём дольше
+            if any(kw in err.lower() for kw in ("rate", "limit", "quota", "429", "ban", "blocked")):
+                logger.warning("g4f [%s]: похоже рейт-лимит, жду 30 сек...", model)
+                await asyncio.sleep(30)
+            else:
+                await asyncio.sleep(random.uniform(3, 8))
+
+    return None, "g4f: все доступные модели не дали результат"
 
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
@@ -1102,13 +1161,12 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
 
 
 async def fetch_meme_melstroy() -> tuple:
-    import subprocess, glob
+    import subprocess
 
     playlist_url = f"https://www.youtube.com/playlist?list={MEME_PLAYLIST_ID}"
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
-    # Получаем список видео
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s",
@@ -1131,7 +1189,9 @@ async def fetch_meme_melstroy() -> tuple:
     logger.info("Плейлист Мелстроя: %d видео", len(lines))
     random.shuffle(lines)
 
-    for entry in lines[:15]:
+    VIDEO_FORMATS = ["18", "22", "17"]
+
+    for entry in lines[:12]:
         parts = entry.split("\t", 1)
         if len(parts) < 2:
             continue
@@ -1139,45 +1199,35 @@ async def fetch_meme_melstroy() -> tuple:
         yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            out_path = os.path.join(tmpdir, "meme.%(ext)s")
-            try:
-                r = subprocess.run(
-                    [
-                        "yt-dlp",
-                        "--no-playlist", "--no-warnings",
-                        "--socket-timeout", "30",
-                        "--retries", "3",
-                        "--max-filesize", "49m",
-                        "-f", "b[height<=480][ext=mp4]/b[height<=480]/bv*[height<=480]+ba/b",
-                        "--merge-output-format", "mp4",
-                        "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        *cookies_args,
-                        "-o", out_path,
-                        yt_url,
-                    ],
-                    capture_output=True, text=True, timeout=120,
-                )
-                files = glob.glob(os.path.join(tmpdir, "meme.*"))
-                if not files:
-                    stderr = (r.stderr or "")[:150]
-                    logger.info("Мем %s: нет файла. stderr: %s", vid_id, stderr)
+            for fmt in VIDEO_FORMATS:
+                out_path = os.path.join(tmpdir, f"v{fmt}.%(ext)s")
+                try:
+                    r = subprocess.run(
+                        ["yt-dlp", "-f", "b[height<=480]/bv*[height<=480]+ba/b",
+                        "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
+                        "-o", out_path, f"https://www.youtube.com/watch?v={vid_id}"],
+                        capture_output=True, text=True, timeout=120
+                    )
+                    if r.returncode != 0:
+                        stderr = r.stderr or ""
+                    if "not available" in stderr or "Requested format" in stderr:
+                        logger.info("fmt=%r недоступен для %s", fmt, vid_id)
+                        continue
+                    import glob
+                    files = glob.glob(os.path.join(tmpdir, f"v{fmt}.*"))
+                    if files:
+                        fpath = files[0]
+                        size = os.path.getsize(fpath)
+                        if 10_000 < size <= 49 * 1024 * 1024:
+                            video_bytes = open(fpath, "rb").read()
+                            logger.info("✓ мем fmt=%r: %dKB '%s'", fmt, len(video_bytes)//1024, title[:30])
+                            return video_bytes, title
+                except subprocess.TimeoutExpired:
                     continue
-                fpath = files[0]
-                size = os.path.getsize(fpath)
-                if size < 10_000:
-                    logger.info("Мем %s: файл слишком маленький (%d bytes)", vid_id, size)
-                    continue
-                video_bytes = open(fpath, "rb").read()
-                logger.info("✓ мем: %dKB '%s'", len(video_bytes) // 1024, title[:30])
-                return video_bytes, title
-            except subprocess.TimeoutExpired:
-                logger.info("Мем %s: таймаут скачивания", vid_id)
-                continue
-            except Exception as e:
-                logger.info("Мем %s: exception: %s", vid_id, str(e)[:80])
-                continue
+                except Exception as e:
+                    logger.info("fmt=%r exception: %s", fmt, str(e)[:60])
 
-    return None, "Не удалось скачать ни одно видео из плейлиста"
+    return None, "Не удалось скачать (YouTube блокирует серверный IP)"
 
 
 # ── Цитата ────────────────────────────────────────────────────────────────────
@@ -1597,51 +1647,73 @@ def _start_ngrok(domain: str):
 # ── Воркер очереди рисования ──────────────────────────────────────────────────
 
 async def _do_generate_image(prompt_raw: str) -> tuple[bytes | None, str]:
-    """Генерирует картинку через g4f, перебирая модели."""
+    """
+    Переводит промпт, улучшает его, затем генерирует картинку через g4f.
+    Возвращает (bytes, prompt_raw) при успехе или (None, error_str) при ошибке.
+    """
+    # 1. Перевод на английский
     prompt_en = await translate_prompt_to_english(prompt_raw)
-    logger.info("Draw: '%s' → '%s'", prompt_raw, prompt_en)
-    image_bytes, error_str = await generate_image_g4f(prompt_en)
+
+    # 2. Улучшение промпта (добавляем стиль и теги качества)
+    prompt_enhanced = enhance_prompt(prompt_en)
+    logger.info(
+        "Draw: '%s' → en='%s' → enhanced (len=%d)",
+        prompt_raw[:40], prompt_en[:40], len(prompt_enhanced)
+    )
+
+    # 3. Генерация
+    image_bytes, error_str = await generate_image_g4f(prompt_enhanced)
     if image_bytes:
         return image_bytes, prompt_raw
-    logger.warning("Draw: g4f: %s", error_str)
+    logger.warning("Draw: g4f провалился: %s", error_str)
     return None, error_str
 
 
-async def _draw_queue_worker(chat_id: int, bot):
+async def _global_draw_worker(bot):
     """
-    Воркер очереди рисования для одного чата.
-    Правила:
-      - одновременно 1 генерация на чат
-      - после завершения ждём 40 секунд с момента старта генерации,
-        потом берём следующего из очереди
+    Единственный глобальный воркер генерации картинок для всего бота.
+
+    Почему глобальный, а не per-chat:
+    • g4f-провайдеры банят по IP при параллельных запросах — даже 2 одновременных
+      запроса к flux от разных чатов могут дать рейт-лимит.
+    • Глобальная очередь + пауза DRAW_COOLDOWN_SEC между генерациями полностью
+      исключает параллельные обращения к API.
+
+    Элементы очереди: (message, prompt_raw, chat_id)
     """
     from aiogram.types import BufferedInputFile
 
-    _draw_queue_busy[chat_id] = True
-    queue = _draw_queues[chat_id]
+    global _global_draw_busy, _global_draw_last_done
+
+    _global_draw_busy = True
+    queue = _global_draw_queue
 
     try:
         while not queue.empty():
-            message, prompt_raw = await queue.get()
-            queue_size = queue.qsize()
+            message, prompt_raw, chat_id = await queue.get()
 
-            start_time = time.time()
-
-            # Ждём, если с прошлой генерации не прошло 40 сек
-            last_done = _draw_last_done.get(chat_id, 0)
-            gap = time.time() - last_done
+            # ── Ждём глобальный кулдаун между генерациями ────────────────────
+            gap = time.time() - _global_draw_last_done
             if gap < DRAW_COOLDOWN_SEC:
-                wait = DRAW_COOLDOWN_SEC - gap
-                logger.info("Draw queue [chat %s]: ждём %.1f сек между генерациями", chat_id, wait)
-                await asyncio.sleep(wait)
+                wait_sec = DRAW_COOLDOWN_SEC - gap
+                # Дополнительный случайный джиттер 0–10 сек (антибан)
+                wait_sec += random.uniform(0, 10)
+                logger.info(
+                    "Draw global worker: ждём %.1f сек (антибан пауза)", wait_sec
+                )
+                await asyncio.sleep(wait_sec)
 
-            status_msg = await message.reply("🎨 Рисую, подожди (~30-60 сек)...")
+            status_msg = await message.reply("🎨 Рисую, подожди (~30–90 сек)...")
+
             try:
                 image_bytes, result_info = await _do_generate_image(prompt_raw)
-                _draw_last_done[chat_id] = time.time()
+                _global_draw_last_done = time.time()
 
                 if not image_bytes:
-                    await status_msg.edit_text(f"😔 Не получилось нарисовать: {result_info}")
+                    await status_msg.edit_text(
+                        f"😔 Не получилось нарисовать: {result_info}\n"
+                        f"Попробуй чуть позже — провайдер временно недоступен."
+                    )
                 else:
                     photo = BufferedInputFile(image_bytes, filename="draw.png")
                     await message.reply_photo(
@@ -1654,31 +1726,38 @@ async def _draw_queue_worker(chat_id: int, bot):
                     except Exception:
                         pass
 
-                # Если в очереди ещё есть — предупредим следующего
+                # Уведомляем следующего в глобальной очереди
                 if not queue.empty():
-                    elapsed = time.time() - start_time
-                    wait_left = max(0, DRAW_COOLDOWN_SEC - elapsed)
-                    if wait_left > 1:
-                        try:
-                            next_msg, _ = queue.queue[0]  # peek
-                            await next_msg.reply(
-                                f"⏳ Скоро твоя очередь! Старт через ~{int(wait_left)} сек.",
-                                parse_mode="HTML",
-                            )
-                        except Exception:
-                            pass
+                    # peek без изъятия
+                    try:
+                        next_msg, _, _ = list(queue._queue)[0]  # type: ignore[attr-defined]
+                        elapsed   = time.time() - _global_draw_last_done
+                        wait_left = max(0, DRAW_COOLDOWN_SEC - elapsed) + 15  # +запас
+                        await next_msg.reply(
+                            f"⏳ Ты следующий! Примерное ожидание ~{int(wait_left)} сек.",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
 
             except Exception as e:
-                logger.exception("Draw queue worker error: %s", e)
-                _draw_last_done[chat_id] = time.time()
+                logger.exception("Draw global worker error: %s", e)
+                _global_draw_last_done = time.time()
                 try:
-                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                    await status_msg.edit_text(f"❌ Ошибка генерации: {str(e)[:100]}")
                 except Exception:
                     pass
             finally:
                 queue.task_done()
+
     finally:
-        _draw_queue_busy[chat_id] = False
+        _global_draw_busy = False
+
+
+# Оставляем старые переменные для обратной совместимости (не используются активно)
+async def _draw_queue_worker(chat_id: int, bot):
+    """Устаревший per-chat воркер — делегирует в глобальный."""
+    pass
 
 
 # ── Основной цикл бота ────────────────────────────────────────────────────────
@@ -1688,6 +1767,10 @@ async def run_bot(backend=None):
     from aiogram.types import Message, CallbackQuery
 
     _chat_state_load()
+
+    # Инициализируем глобальную очередь картинок
+    global _global_draw_queue
+    _global_draw_queue = asyncio.Queue()
 
     if not BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN не задан — бот не запущен")
@@ -1992,30 +2075,28 @@ async def run_bot(backend=None):
                 await message.reply("❌ Промпт слишком длинный (макс 300 символов)")
                 return
 
-            # Инициализируем очередь для чата
-            if chat_id not in _draw_queues:
-                _draw_queues[chat_id]     = asyncio.Queue()
-                _draw_queue_busy[chat_id] = False
-
-            queue = _draw_queues[chat_id]
+            # Глобальная очередь — считаем сколько всего запросов ждёт
+            queue = _global_draw_queue
             pos   = queue.qsize()
 
-            if pos >= 5:
-                await message.reply("🚫 Очередь переполнена (макс 5). Попробуй позже.")
+            if pos >= 8:
+                await message.reply("🚫 Очередь переполнена (макс 8). Попробуй через пару минут.")
                 return
 
-            # Сообщаем пользователю его позицию в очереди
-            if _draw_queue_busy[chat_id] or pos > 0:
+            # Сообщаем позицию + примерное время ожидания
+            if _global_draw_busy or pos > 0:
+                est_wait = (pos + 1) * (DRAW_COOLDOWN_SEC + 30)  # ~85 сек на генерацию
                 await message.reply(
-                    f"⏳ Ты в очереди — позиция <b>{pos + 1}</b>. Скоро нарисую!",
+                    f"⏳ Ты в очереди — позиция <b>{pos + 1}</b>.\n"
+                    f"Примерное ожидание: ~{est_wait // 60} мин {est_wait % 60} сек.",
                     parse_mode="HTML",
                 )
 
-            await queue.put((message, prompt_raw))
+            await queue.put((message, prompt_raw, chat_id))
 
-            # Запускаем worker если не запущен
-            if not _draw_queue_busy[chat_id]:
-                asyncio.create_task(_draw_queue_worker(chat_id, bot))
+            # Запускаем глобальный воркер если не запущен
+            if not _global_draw_busy:
+                asyncio.create_task(_global_draw_worker(bot))
             return
 
         if SEARCH_TRIGGER.lower() in text:
