@@ -532,16 +532,79 @@ async def generate_image_local(prompt: str) -> tuple:
             return None, str(e)[:100]
 
 
+async def _generate_hf_image(prompt: str) -> tuple:
+    """
+    HuggingFace Inference API — FLUX.1-schnell.
+    Нужен бесплатный токен: huggingface.co → Settings → Access Tokens → New token (Read).
+    Добавь в .env: HUGGINGFACE_TOKEN=hf_xxxxx
+    Бесплатный аккаунт даёт месячные кредиты.
+    """
+    if not HUGGINGFACE_TOKEN:
+        return None, "HUGGINGFACE_TOKEN не задан (создай на huggingface.co бесплатно)"
+    import aiohttp
+
+    models = [
+        "black-forest-labs/FLUX.1-schnell",
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        "runwayml/stable-diffusion-v1-5",
+    ]
+    headers = {
+        "Authorization": f"Bearer {HUGGINGFACE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for model in models:
+            url = f"https://api-inference.huggingface.co/models/{model}"
+            label = f"hf/{model.split('/')[-1]}"
+            try:
+                logger.info("hf: пробуем %s...", label)
+                payload = {"inputs": prompt, "parameters": {"num_inference_steps": 4}}
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status == 503:
+                        # Модель загружается — ждём и пробуем ещё раз
+                        body = await resp.json(content_type=None)
+                        wait = body.get("estimated_time", 20)
+                        logger.info("hf [%s]: модель загружается, ждём %.0f сек...", label, wait)
+                        await asyncio.sleep(min(wait, 25))
+                        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp2:
+                            if resp2.status == 200:
+                                img_bytes = await resp2.read()
+                                if len(img_bytes) > 5000:
+                                    logger.info("hf [%s]: ✓ %dKB (retry)", label, len(img_bytes) // 1024)
+                                    return img_bytes, None
+                        continue
+                    if resp.status == 429:
+                        logger.warning("hf [%s]: rate limit", label)
+                        continue
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning("hf [%s]: HTTP %d: %s", label, resp.status, body[:80])
+                        continue
+                    img_bytes = await resp.read()
+                    ct = resp.headers.get("Content-Type", "")
+                    if len(img_bytes) > 5000 and ("image" in ct or len(img_bytes) > 10000):
+                        logger.info("hf [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
+                        return img_bytes, None
+                    logger.warning("hf [%s]: ct=%s size=%d", label, ct, len(img_bytes))
+            except asyncio.TimeoutError:
+                logger.warning("hf [%s]: таймаут", label)
+            except Exception as e:
+                logger.warning("hf [%s]: %s", label, str(e)[:80])
+
+    return None, "hf: все модели не ответили"
+
+
 async def _generate_gemini_image(prompt: str) -> tuple:
-    """Gemini 2.0 Flash image generation — бесплатно, без CF."""
+    """Gemini 2.0 Flash image generation — бесплатно 15 RPM / 1500 RPD."""
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY не задан"
     import aiohttp, base64, json as _json
 
-    model = "gemini-2.0-flash-exp-image-generation"
     url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={GEMINI_API_KEY}"
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.0-flash-exp-image-generation:generateContent"
+        f"?key={GEMINI_API_KEY}"
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -552,14 +615,11 @@ async def _generate_gemini_image(prompt: str) -> tuple:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 body = await resp.read()
                 if resp.status == 429:
-                    return None, "gemini: квота/rate-limit (429)"
+                    return None, "gemini: rate-limit 429 (подожди минуту)"
                 if resp.status != 200:
                     return None, f"gemini: HTTP {resp.status}: {body[:100].decode(errors='replace')}"
                 data = _json.loads(body)
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    return None, f"gemini: нет candidates"
-                for part in candidates[0].get("content", {}).get("parts", []):
+                for part in (data.get("candidates") or [{}])[0].get("content", {}).get("parts", []):
                     inline = part.get("inlineData") or part.get("inline_data")
                     if inline and inline.get("data"):
                         img_bytes = base64.b64decode(inline["data"])
@@ -572,199 +632,42 @@ async def _generate_gemini_image(prompt: str) -> tuple:
         return None, f"gemini: {str(e)[:100]}"
 
 
-async def _generate_airforce_image(prompt: str) -> tuple:
-    """
-    Прямой запрос к api.airforce — без g4f.
-    Модели flux бесплатны, не за CF, работают с Railway.
-    """
-    import aiohttp, urllib.parse
-
-    encoded = urllib.parse.quote(prompt)
-    models = ["flux", "flux-anime", "flux-3d", "any-dark"]
-    base_urls = [
-        "https://api.airforce/imagine2",
-        "https://llmplayground.net/imagine2",
-    ]
-
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        for base in base_urls:
-            for model in models:
-                url = f"{base}/{encoded}?model={model}&width=512&height=512"
-                label = f"airforce/{model}"
-                try:
-                    logger.info("airforce: пробуем %s...", label)
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=50), allow_redirects=True) as resp:
-                        if resp.status != 200:
-                            logger.warning("airforce [%s]: HTTP %d", label, resp.status)
-                            continue
-                        ct = resp.headers.get("Content-Type", "")
-                        if "image" not in ct:
-                            text = await resp.text()
-                            # Иногда возвращают путь /images/... — добавляем хост
-                            if text.strip().startswith("/images/"):
-                                img_url = f"https://api.airforce{text.strip()}"
-                                async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=30)) as r2:
-                                    if r2.status == 200:
-                                        img_bytes = await r2.read()
-                                        if len(img_bytes) > 5000:
-                                            logger.info("airforce [%s]: ✓ %dKB (redirect)", label, len(img_bytes) // 1024)
-                                            return img_bytes, None
-                            logger.warning("airforce [%s]: Content-Type=%s", label, ct)
-                            continue
-                        img_bytes = await resp.read()
-                        if len(img_bytes) > 5000:
-                            logger.info("airforce [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
-                            return img_bytes, None
-                        logger.warning("airforce [%s]: слишком мало байт: %d", label, len(img_bytes))
-                except asyncio.TimeoutError:
-                    logger.warning("airforce [%s]: таймаут", label)
-                except Exception as e:
-                    logger.warning("airforce [%s]: %s", label, str(e)[:80])
-
-    return None, "airforce: все модели/эндпоинты не ответили"
-
-
-async def _generate_nexra_image(prompt: str) -> tuple:
-    """
-    Прямой запрос к nexra.aryahcr.cc — ещё один бесплатный провайдер.
-    """
-    import aiohttp, json as _json
-
-    models = ["midjourney", "dall-e-3", "stablediffusion-xl"]
-    url = "https://nexra.aryahcr.cc/api/image/complements"
-
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}) as session:
-        for model in models:
-            label = f"nexra/{model}"
-            try:
-                logger.info("nexra: пробуем %s...", label)
-                async with session.post(
-                    url,
-                    json={"prompt": prompt, "model": model, "response": "url"},
-                    timeout=aiohttp.ClientTimeout(total=50),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning("nexra [%s]: HTTP %d", label, resp.status)
-                        continue
-                    data = await resp.json(content_type=None)
-                    img_url = data.get("url") or (data.get("images") or [None])[0]
-                    if not img_url:
-                        logger.warning("nexra [%s]: нет URL в ответе", label)
-                        continue
-                    async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=30)) as r2:
-                        if r2.status == 200:
-                            img_bytes = await r2.read()
-                            if len(img_bytes) > 5000:
-                                logger.info("nexra [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
-                                return img_bytes, None
-            except asyncio.TimeoutError:
-                logger.warning("nexra [%s]: таймаут", label)
-            except Exception as e:
-                logger.warning("nexra [%s]: %s", label, str(e)[:80])
-
-    return None, "nexra: все модели не ответили"
-
-
-async def _generate_g4f_image(prompt: str) -> tuple:
-    """g4f как последний резерв — если установлен."""
-    import aiohttp
-    try:
-        from g4f.client import Client as G4FClient
-        import g4f.Provider as Providers
-    except ImportError:
-        return None, "g4f не установлен"
-
-    attempts = []
-    for name, model in [
-        ("Airforce",       "flux"),
-        ("ImageLabs",      ""),
-        ("DiffusersImage", "black-forest-labs/FLUX.1-schnell"),
-    ]:
-        p = getattr(Providers, name, None)
-        if p is not None:
-            attempts.append((p, model))
-
-    if not attempts:
-        return None, "g4f: провайдеры не найдены"
-
-    loop = asyncio.get_event_loop()
-    for provider, model in attempts:
-        label = (f"{getattr(provider, '__name__', provider)}/{model}"
-                 if model else getattr(provider, '__name__', str(provider)))
-        try:
-            def _gen(p=provider, m=model):
-                client = G4FClient()
-                kwargs = {"prompt": prompt, "provider": p, "response_format": "url"}
-                if m:
-                    kwargs["model"] = m
-                resp = client.images.generate(**kwargs)
-                return resp.data[0].url if resp.data else None
-
-            logger.info("g4f: пробуем %s...", label)
-            img_url = await asyncio.wait_for(loop.run_in_executor(None, _gen), timeout=50)
-            if not img_url:
-                continue
-
-            # Если путь относительный — добавляем хост
-            if img_url.startswith("/"):
-                img_url = f"https://api.airforce{img_url}"
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=40)) as resp:
-                    if resp.status == 200:
-                        ct = resp.headers.get("Content-Type", "")
-                        img_bytes = await resp.read()
-                        if len(img_bytes) > 5000 and ("image" in ct or len(img_bytes) > 10000):
-                            logger.info("g4f [%s]: ✓ %dKB", label, len(img_bytes) // 1024)
-                            return img_bytes, None
-        except asyncio.TimeoutError:
-            logger.warning("g4f [%s]: таймаут", label)
-        except Exception as e:
-            logger.warning("g4f [%s]: %s", label, str(e)[:80])
-
-    return None, "g4f: все провайдеры не дали результат"
-
-
 async def generate_image_g4f(prompt: str) -> tuple:
     """
-    Генерация без зависимости от g4f. Порядок:
-      1. Gemini 2.0 Flash — бесплатно, прямой Google API
-      2. api.airforce   — прямой HTTP без g4f
-      3. nexra          — прямой HTTP без g4f
-      4. g4f            — если установлен (резервный)
-      5. Локальный SD   — если установлен diffusers
+    Генерация изображений. Порядок:
+      1. HuggingFace Inference API (FLUX.1-schnell) — нужен бесплатный HF токен
+         Создай на https://huggingface.co/settings/tokens (Read token, бесплатно)
+         Добавь в Railway: HUGGINGFACE_TOKEN=hf_xxxxxxxx
+      2. Gemini 2.0 Flash — бесплатно 15 RPM, уже есть ключ
+      3. Локальный SD — если установлен diffusers
     """
+    # 1. HuggingFace — самый надёжный с токеном
+    logger.info("Draw: пробуем HuggingFace...")
+    img, err = await _generate_hf_image(prompt)
+    if img:
+        return img, None
+    logger.warning("Draw: HF: %s", err)
+
+    # 2. Gemini
     logger.info("Draw: пробуем Gemini...")
     img, err = await _generate_gemini_image(prompt)
     if img:
         return img, None
     logger.warning("Draw: Gemini: %s", err)
 
-    logger.info("Draw: пробуем Airforce (прямой HTTP)...")
-    img, err = await _generate_airforce_image(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: Airforce: %s", err)
-
-    logger.info("Draw: пробуем Nexra (прямой HTTP)...")
-    img, err = await _generate_nexra_image(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: Nexra: %s", err)
-
-    logger.info("Draw: пробуем g4f (резерв)...")
-    img, err = await _generate_g4f_image(prompt)
-    if img:
-        return img, None
-    logger.warning("Draw: g4f: %s", err)
-
+    # 3. Локальный SD
     logger.info("Draw: пробуем локальный SD...")
     img, err = await generate_image_local(prompt)
     if img:
         return img, None
     logger.warning("Draw: SD: %s", err)
 
-    return None, "все методы провалились (Gemini + Airforce + Nexra + g4f + SD)"
+    return None, (
+        "все методы провалились.\n"
+        "💡 Реши проблему: добавь HUGGINGFACE_TOKEN в Railway\n"
+        "→ huggingface.co → Settings → Access Tokens → New token (Read)\n"
+        "→ Railway → Variables → HUGGINGFACE_TOKEN = hf_xxxxx"
+    )
 
 
 # ── Скачивание музыки ─────────────────────────────────────────────────────────
