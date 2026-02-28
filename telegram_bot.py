@@ -980,12 +980,13 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
 
 
 async def fetch_meme_melstroy() -> tuple:
-    import subprocess
+    import subprocess, glob
 
     playlist_url = f"https://www.youtube.com/playlist?list={MEME_PLAYLIST_ID}"
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
+    # Получаем список видео
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s",
@@ -1008,9 +1009,7 @@ async def fetch_meme_melstroy() -> tuple:
     logger.info("Плейлист Мелстроя: %d видео", len(lines))
     random.shuffle(lines)
 
-    VIDEO_FORMATS = ["18", "22", "17"]
-
-    for entry in lines[:12]:
+    for entry in lines[:15]:
         parts = entry.split("\t", 1)
         if len(parts) < 2:
             continue
@@ -1018,35 +1017,45 @@ async def fetch_meme_melstroy() -> tuple:
         yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            for fmt in VIDEO_FORMATS:
-                out_path = os.path.join(tmpdir, f"v{fmt}.%(ext)s")
-                try:
-                    r = subprocess.run(
-                        ["yt-dlp", "-f", "b[height<=480]/bv*[height<=480]+ba/b",
-                        "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
-                        "-o", out_path, f"https://www.youtube.com/watch?v={vid_id}"],
-                        capture_output=True, text=True, timeout=120
-                    )
-                    if r.returncode != 0:
-                        stderr = r.stderr or ""
-                    if "not available" in stderr or "Requested format" in stderr:
-                        logger.info("fmt=%r недоступен для %s", fmt, vid_id)
-                        continue
-                    import glob
-                    files = glob.glob(os.path.join(tmpdir, f"v{fmt}.*"))
-                    if files:
-                        fpath = files[0]
-                        size = os.path.getsize(fpath)
-                        if 10_000 < size <= 49 * 1024 * 1024:
-                            video_bytes = open(fpath, "rb").read()
-                            logger.info("✓ мем fmt=%r: %dKB '%s'", fmt, len(video_bytes)//1024, title[:30])
-                            return video_bytes, title
-                except subprocess.TimeoutExpired:
+            out_path = os.path.join(tmpdir, "meme.%(ext)s")
+            try:
+                r = subprocess.run(
+                    [
+                        "yt-dlp",
+                        "--no-playlist", "--no-warnings",
+                        "--socket-timeout", "30",
+                        "--retries", "3",
+                        "--max-filesize", "49m",
+                        "-f", "b[height<=480][ext=mp4]/b[height<=480]/bv*[height<=480]+ba/b",
+                        "--merge-output-format", "mp4",
+                        "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        *cookies_args,
+                        "-o", out_path,
+                        yt_url,
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
+                files = glob.glob(os.path.join(tmpdir, "meme.*"))
+                if not files:
+                    stderr = (r.stderr or "")[:150]
+                    logger.info("Мем %s: нет файла. stderr: %s", vid_id, stderr)
                     continue
-                except Exception as e:
-                    logger.info("fmt=%r exception: %s", fmt, str(e)[:60])
+                fpath = files[0]
+                size = os.path.getsize(fpath)
+                if size < 10_000:
+                    logger.info("Мем %s: файл слишком маленький (%d bytes)", vid_id, size)
+                    continue
+                video_bytes = open(fpath, "rb").read()
+                logger.info("✓ мем: %dKB '%s'", len(video_bytes) // 1024, title[:30])
+                return video_bytes, title
+            except subprocess.TimeoutExpired:
+                logger.info("Мем %s: таймаут скачивания", vid_id)
+                continue
+            except Exception as e:
+                logger.info("Мем %s: exception: %s", vid_id, str(e)[:80])
+                continue
 
-    return None, "Не удалось скачать (YouTube блокирует серверный IP)"
+    return None, "Не удалось скачать ни одно видео из плейлиста"
 
 
 # ── Цитата ────────────────────────────────────────────────────────────────────
