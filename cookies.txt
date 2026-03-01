@@ -14,3 +14,7 @@
 .youtube.com	TRUE	/	TRUE	1787784098	VISITOR_INFO1_LIVE	Pb2DqNxNU64
 .youtube.com	TRUE	/	TRUE	1787762054	__Secure-ROLLOUT_TOKEN	CPbds9yEhOWJvAEQj--bxK7qkQMYlqOl9Yz6kgM%3D
 .youtube.com	TRUE	/	TRUE	1772233898	GPS	1
+.tiktok.com	TRUE	/	TRUE	1803477837	ttwid	1%7Cll-XGcZ8_Twlty-EfUp-GV_mbgA_xv1ODvlyXbvw9Q8%7C1772373837%7C6855a2d817bbfa1e172213c1beb3093adaa4e3cd47a01afc3faa1efef69f2de3
+.tiktok.com	TRUE	/	TRUE	0	tt_csrf_token	h1GsMJRq-KY-NnIxIGR01gkE2Lf1hajz91u0
+.tiktok.com	TRUE	/	TRUE	1787925852	tt_chain_token	9ijQn+oUQbeReVce9OheEw==
+.tiktok.com	TRUE	/	TRUE	1773237852	msToken	yyUd4ijl5z-1519XkCN849zNaa9qXV8stpkVh--e6Ub3Gr1I23ZGpzeYPYKjheZ2XHD_Qx_1mm3XI0Mny3M1tSYcc1UYZ7fbvvLAOJ-bUSmBm_F3oVXYaV8=

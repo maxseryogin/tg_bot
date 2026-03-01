@@ -423,9 +423,8 @@ HELP_TEXT = (
     "</pre>"
 )
 
-MEME_TRIGGER     = "жужа мем мелстрой"
+MEME_TRIGGER      = "жужа мем мелстрой"
 MEME_COOLDOWN_SEC = 60
-MEME_PLAYLIST_ID = "PLxlt0ae8BD2whwfIfPGtwtn7sOami7s7b"
 
 HF_MODELS = [
     "stabilityai/stable-diffusion-3.5-medium",
@@ -1140,73 +1139,149 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
     return None, "cobalt video: все инстанции недоступны"
 
 
-async def fetch_meme_melstroy() -> tuple:
-    import subprocess
+TIKTOK_ACCOUNT = "footage_me1"
 
-    playlist_url = f"https://www.youtube.com/playlist?list={MEME_PLAYLIST_ID}"
+
+async def fetch_meme_melstroy() -> tuple:
+    """
+    Качает рандомное видео с TikTok-аккаунта footage_me1 без водяного знака.
+    Возвращает (video_bytes, caption) где caption — описание в стиле названия мема.
+    """
+    import subprocess
+    import glob
+
+    account_url = f"https://www.tiktok.com/@{TIKTOK_ACCOUNT}"
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
+    # Шаг 1: получить список видео с аккаунта
+    logger.info("TikTok: получаем список видео @%s", TIKTOK_ACCOUNT)
     try:
         result = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s",
-             "--no-warnings", *cookies_args, playlist_url],
-            capture_output=True, text=True, timeout=30,
+            [
+                "yt-dlp",
+                "--flat-playlist",
+                "--print", "%(id)s\t%(title)s",
+                "--no-warnings",
+                "--extractor-args", "tiktok:webpage_download=true",
+                *cookies_args,
+                account_url,
+            ],
+            capture_output=True, text=True, timeout=60,
         )
         lines = [l.strip() for l in result.stdout.splitlines() if "\t" in l]
         if result.stderr and not lines:
-            logger.warning("Плейлист stderr: %r", result.stderr[:200])
+            logger.warning("TikTok flat-playlist stderr: %r", result.stderr[:300])
     except FileNotFoundError:
         return None, "yt-dlp не установлен"
     except subprocess.TimeoutExpired:
-        return None, "Таймаут при получении плейлиста"
+        return None, "Таймаут при получении списка видео TikTok"
     except Exception as e:
         return None, f"Ошибка: {str(e)[:80]}"
 
     if not lines:
-        return None, "Плейлист пустой или недоступен"
+        # Запасной вариант: попробуем скачать напрямую без листинга
+        logger.warning("TikTok: список пустой, пробуем прямой URL аккаунта")
+        lines = []
 
-    logger.info("Плейлист Мелстроя: %d видео", len(lines))
-    random.shuffle(lines)
+    logger.info("TikTok @%s: найдено %d видео", TIKTOK_ACCOUNT, len(lines))
 
-    VIDEO_FORMATS = ["18", "22", "17"]
+    # Выбираем рандомные видео для попытки скачать
+    if lines:
+        random.shuffle(lines)
+        candidates = lines[:10]
+    else:
+        # Если листинг не работает — попробуем скачать сам аккаунт (первые N)
+        candidates = [f"__direct__\t@{TIKTOK_ACCOUNT}"]
 
-    for entry in lines[:12]:
+    for entry in candidates:
         parts = entry.split("\t", 1)
         if len(parts) < 2:
             continue
-        vid_id, title = parts[0].strip(), parts[1].strip()
+        vid_id, raw_title = parts[0].strip(), parts[1].strip()
+
+        if vid_id == "__direct__":
+            video_url = account_url
+        else:
+            video_url = f"https://www.tiktok.com/@{TIKTOK_ACCOUNT}/video/{vid_id}"
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            for fmt in VIDEO_FORMATS:
-                out_path = os.path.join(tmpdir, f"v{fmt}.%(ext)s")
-                try:
-                    r = subprocess.run(
-                        ["yt-dlp", "-f", "b[height<=480]/bv*[height<=480]+ba/b",
-                        "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
-                        "-o", out_path, f"https://www.youtube.com/watch?v={vid_id}"],
-                        capture_output=True, text=True, timeout=120
-                    )
-                    if r.returncode != 0:
-                        stderr = r.stderr or ""
-                        if "not available" in stderr or "Requested format" in stderr:
-                            logger.info("fmt=%r недоступен для %s", fmt, vid_id)
-                            continue
-                    import glob
-                    files = glob.glob(os.path.join(tmpdir, f"v{fmt}.*"))
-                    if files:
-                        fpath = files[0]
-                        size = os.path.getsize(fpath)
-                        if 10_000 < size <= 49 * 1024 * 1024:
-                            video_bytes = open(fpath, "rb").read()
-                            logger.info("✓ мем fmt=%r: %dKB '%s'", fmt, len(video_bytes)//1024, title[:30])
-                            return video_bytes, title
-                except subprocess.TimeoutExpired:
-                    continue
-                except Exception as e:
-                    logger.info("fmt=%r exception: %s", fmt, str(e)[:60])
+            out_path = os.path.join(tmpdir, "tiktok.%(ext)s")
+            try:
+                r = subprocess.run(
+                    [
+                        "yt-dlp",
+                        # Без водяного знака: формат без встроенного вотермарка
+                        "-f", "download_addr-2/download_addr/h264/mp4/best",
+                        "--no-playlist",
+                        "--no-warnings",
+                        "--extractor-args", "tiktok:webpage_download=true",
+                        # Пробуем через embed-страницу — обходит watermark
+                        "--add-header", "Referer:https://www.tiktok.com/",
+                        "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "-o", out_path,
+                        *cookies_args,
+                        video_url,
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
 
-    return None, "Не удалось скачать (YouTube блокирует серверный IP)"
+                files = glob.glob(os.path.join(tmpdir, "tiktok.*"))
+                if not files and r.returncode != 0:
+                    logger.info("TikTok: не скачалось %s: %s", vid_id[:20], r.stderr[:100])
+                    continue
+
+                if files:
+                    fpath = files[0]
+                    size = os.path.getsize(fpath)
+                    if size < 5_000:
+                        logger.info("TikTok: файл слишком маленький (%d байт), пропускаем", size)
+                        continue
+                    if size > 49 * 1024 * 1024:
+                        logger.info("TikTok: файл слишком большой (%dMB), пропускаем", size // 1024 // 1024)
+                        continue
+
+                    video_bytes = open(fpath, "rb").read()
+
+                    # Формируем подпись в стиле названия мема
+                    caption = _make_meme_caption(raw_title)
+
+                    logger.info("✓ TikTok мем: %dKB '%s'", len(video_bytes) // 1024, raw_title[:40])
+                    return video_bytes, caption
+
+            except subprocess.TimeoutExpired:
+                logger.info("TikTok: таймаут скачивания %s", vid_id[:20])
+                continue
+            except Exception as e:
+                logger.info("TikTok: исключение для %s: %s", vid_id[:20], str(e)[:60])
+                continue
+
+    return None, "Не удалось скачать видео с TikTok @footage_me1"
+
+
+def _make_meme_caption(raw_title: str) -> str:
+    """
+    Превращает raw_title из TikTok в красивое описание в стиле названия мема.
+    Убирает хэштеги, лишние символы, делает заглавную букву.
+    """
+    if not raw_title:
+        return "🎭 мем мелстрой"
+
+    # Убираем хэштеги
+    title = re.sub(r"#\w+", "", raw_title)
+    # Убираем @упоминания
+    title = re.sub(r"@\w+", "", title)
+    # Убираем лишние пробелы
+    title = re.sub(r"\s+", " ", title).strip()
+    # Убираем emoji-мусор в начале/конце (опционально оставляем)
+    title = title.strip(".,;:!?-–—")
+
+    if not title:
+        return "🎭 мем мелстрой"
+
+    # Заглавная буква
+    title = title[0].upper() + title[1:] if len(title) > 1 else title.upper()
+    return title
 
 
 # ── Цитата ────────────────────────────────────────────────────────────────────
@@ -1974,17 +2049,17 @@ async def run_bot(backend=None):
                 await message.reply("⏱️ Жди 60 секунд, мемы не бесконечные")
                 return
             _meme_cooldowns[user_id] = now
-            status_msg = await message.reply("🎬 Качаю мем, подожди секунду...")
+            status_msg = await message.reply("🎬 Качаю мем с TikTok, сек...")
             try:
                 from aiogram.types import BufferedInputFile
-                video_bytes, title = await fetch_meme_melstroy()
+                video_bytes, caption = await fetch_meme_melstroy()
                 if not video_bytes:
-                    await status_msg.edit_text(f"❌ Не получилось: {title}")
+                    await status_msg.edit_text(f"❌ Не получилось: {caption}")
                     return
                 video_file = BufferedInputFile(video_bytes, filename="meme.mp4")
                 await message.reply_video(
                     video=video_file,
-                    caption=f"🎭 <b>{title}</b>",
+                    caption=f"🎭 <b>{caption}</b>\n<i>@{TIKTOK_ACCOUNT}</i>",
                     parse_mode="HTML",
                     supports_streaming=True,
                 )
