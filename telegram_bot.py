@@ -346,6 +346,7 @@ _search_cooldowns = {}
 _music_cooldowns  = {}
 _help_cooldowns   = {}
 _meme_cooldowns   = {}
+_pikk_cooldowns   = {}
 _draw_cooldowns: dict[int, float] = {}
 
 # ── Жужа-болталка ─────────────────────────────────────────────────────────────
@@ -416,6 +417,7 @@ HELP_TEXT = (
     "жужа го реповать\n"
     "жужа рекламу\n"
     "жужа мем мелстрой\n"
+    "жужа мем пикшанель\n"
     "жужа го говорить\n"
     "жужа хватит говорить\n"
     "жужа ты тут\n"
@@ -425,6 +427,9 @@ HELP_TEXT = (
 
 MEME_TRIGGER      = "жужа мем мелстрой"
 MEME_COOLDOWN_SEC = 60
+
+MEME_PIKK_TRIGGER      = "жужа мем пикшанель"
+MEME_PIKK_COOLDOWN_SEC = 60
 
 HF_MODELS = [
     "stabilityai/stable-diffusion-3.5-medium",
@@ -1139,7 +1144,8 @@ async def _cobalt_download_video(yt_url: str, title: str) -> tuple:
     return None, "cobalt video: все инстанции недоступны"
 
 
-TIKTOK_ACCOUNT = "footage_me1"
+TIKTOK_ACCOUNT      = "footage_me1"
+TIKTOK_PIKK_ACCOUNT = "pikkshannel1"
 
 
 async def fetch_meme_melstroy() -> tuple:
@@ -1282,6 +1288,152 @@ def _make_meme_caption(raw_title: str) -> str:
     # Заглавная буква
     title = title[0].upper() + title[1:] if len(title) > 1 else title.upper()
     return title
+
+
+async def fetch_meme_pikk() -> tuple:
+    """
+    Качает рандомное ВИДЕО (не фото) с TikTok-аккаунта pikkshannel1 без водяного знака.
+    Пропускает посты где только фотографии (несколько медиа без видео).
+    Возвращает (video_bytes, caption).
+    """
+    import subprocess
+    import glob
+
+    account_url = f"https://www.tiktok.com/@{TIKTOK_PIKK_ACCOUNT}"
+    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
+
+    logger.info("TikTok Pikk: получаем список видео @%s", TIKTOK_PIKK_ACCOUNT)
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "--flat-playlist",
+                "--print", "%(id)s\t%(title)s\t%(ext)s\t%(duration)s",
+                "--no-warnings",
+                "--extractor-args", "tiktok:webpage_download=true",
+                *cookies_args,
+                account_url,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        lines = [l.strip() for l in result.stdout.splitlines() if "\t" in l]
+        if result.stderr and not lines:
+            logger.warning("TikTok Pikk flat-playlist stderr: %r", result.stderr[:300])
+    except FileNotFoundError:
+        return None, "yt-dlp не установлен"
+    except subprocess.TimeoutExpired:
+        return None, "Таймаут при получении списка видео TikTok"
+    except Exception as e:
+        return None, f"Ошибка: {str(e)[:80]}"
+
+    if not lines:
+        logger.warning("TikTok Pikk: список пустой, пробуем прямой URL")
+        lines = [f"__direct__\t@{TIKTOK_PIKK_ACCOUNT}\t\t"]
+
+    logger.info("TikTok @%s: найдено %d записей", TIKTOK_PIKK_ACCOUNT, len(lines))
+
+    random.shuffle(lines)
+    candidates = lines[:15]  # берём больше — часть могут быть фото
+
+    for entry in candidates:
+        parts = entry.split("\t", 3)
+        if len(parts) < 2:
+            continue
+        vid_id    = parts[0].strip()
+        raw_title = parts[1].strip()
+        ext       = parts[2].strip() if len(parts) > 2 else ""
+        duration  = parts[3].strip() if len(parts) > 3 else ""
+
+        # Если из метаданных видно что это изображение — пропускаем
+        if ext and ext.lower() in ("jpg", "jpeg", "png", "webp", "gif"):
+            logger.info("TikTok Pikk: пропускаем фото %s (ext=%s)", vid_id[:20], ext)
+            continue
+
+        if vid_id == "__direct__":
+            video_url = account_url
+        else:
+            video_url = f"https://www.tiktok.com/@{TIKTOK_PIKK_ACCOUNT}/video/{vid_id}"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "tiktok.mp4")
+            try:
+                r = subprocess.run(
+                    [
+                        "yt-dlp",
+                        # Явно берём формат с видеодорожкой, mp4
+                        "-f", "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best",
+                        "--merge-output-format", "mp4",
+                        "--no-playlist",
+                        "--no-warnings",
+                        "--extractor-args", "tiktok:webpage_download=true",
+                        "--add-header", "Referer:https://www.tiktok.com/",
+                        "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "-o", out_path,
+                        *cookies_args,
+                        video_url,
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
+
+                files = glob.glob(os.path.join(tmpdir, "tiktok.*"))
+                if not files and r.returncode != 0:
+                    logger.info("TikTok Pikk: не скачалось %s: %s", vid_id[:20], r.stderr[:100])
+                    continue
+
+                if files:
+                    fpath = files[0]
+                    fext  = os.path.splitext(fpath)[1].lower()
+
+                    # Пропускаем если скачалось фото (одно изображение вместо видео)
+                    if fext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                        logger.info("TikTok Pikk: скачалось фото %s, пропускаем", vid_id[:20])
+                        continue
+
+                    size = os.path.getsize(fpath)
+                    if size < 5_000:
+                        logger.info("TikTok Pikk: файл слишком маленький (%d байт), пропускаем", size)
+                        continue
+                    if size > 49 * 1024 * 1024:
+                        logger.info("TikTok Pikk: файл слишком большой (%dMB), пропускаем", size // 1024 // 1024)
+                        continue
+
+                    # Проверяем что в файле есть видеодорожка (не просто аудио)
+                    import shutil as _shutil
+                    _ffprobe = _shutil.which("ffprobe")
+                    if _ffprobe:
+                        _probe = subprocess.run(
+                            [_ffprobe, "-v", "error", "-select_streams", "v:0",
+                             "-show_entries", "stream=codec_type",
+                             "-of", "default=noprint_wrappers=1:nokey=1", fpath],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        if "video" not in _probe.stdout:
+                            logger.info("TikTok Pikk: нет видеодорожки в %s, пропускаем", vid_id[:20])
+                            continue
+
+                    video_bytes = open(fpath, "rb").read()
+
+                    # Капшн в стиле пикшанель
+                    title = re.sub(r"#\w+", "", raw_title)
+                    title = re.sub(r"@\w+", "", title)
+                    title = re.sub(r"\s+", " ", title).strip().strip(".,;:!?-–—")
+                    if not title:
+                        caption = "📹 пикшанель"
+                    else:
+                        caption = title[0].upper() + title[1:] if len(title) > 1 else title.upper()
+
+                    logger.info("✓ TikTok Pikk: %dKB '%s'", len(video_bytes) // 1024, raw_title[:40])
+                    return video_bytes, caption
+
+            except subprocess.TimeoutExpired:
+                logger.info("TikTok Pikk: таймаут скачивания %s", vid_id[:20])
+                continue
+            except Exception as e:
+                logger.info("TikTok Pikk: исключение для %s: %s", vid_id[:20], str(e)[:60])
+                continue
+
+    return None, f"Не удалось скачать видео с TikTok @{TIKTOK_PIKK_ACCOUNT}"
 
 
 # ── Цитата ────────────────────────────────────────────────────────────────────
@@ -2069,6 +2221,39 @@ async def run_bot(backend=None):
                     pass
             except Exception as e:
                 logger.exception("Ошибка отправки мема: %s", e)
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                except Exception:
+                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+            return
+
+        if MEME_PIKK_TRIGGER.lower() in text:
+            now  = time.time()
+            last = _pikk_cooldowns.get(user_id, 0)
+            if now - last < MEME_PIKK_COOLDOWN_SEC:
+                await message.reply("⏱️ Жди 60 секунд, мемы не бесконечные")
+                return
+            _pikk_cooldowns[user_id] = now
+            status_msg = await message.reply("🎬 Качаю мем пикшанель, сек...")
+            try:
+                from aiogram.types import BufferedInputFile
+                video_bytes, caption = await fetch_meme_pikk()
+                if not video_bytes:
+                    await status_msg.edit_text(f"❌ Не получилось: {caption}")
+                    return
+                video_file = BufferedInputFile(video_bytes, filename="pikk.mp4")
+                await message.reply_video(
+                    video=video_file,
+                    caption=f"📹 <b>{caption}</b>\n<i>@{TIKTOK_PIKK_ACCOUNT}</i>",
+                    parse_mode="HTML",
+                    supports_streaming=True,
+                )
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.exception("Ошибка отправки мема пикшанель: %s", e)
                 try:
                     await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
                 except Exception:
