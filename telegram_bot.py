@@ -889,10 +889,10 @@ async def _youtube_download(query: str) -> tuple:
     import glob
     import shutil as _sh
 
-    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_yt.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
     if cookies_args:
-        logger.info("YouTube: используем cookies.txt")
+        logger.info("YouTube: используем cookies_yt.txt")
 
     loop = asyncio.get_event_loop()
 
@@ -1157,7 +1157,7 @@ async def fetch_meme_melstroy() -> tuple:
     import glob
 
     account_url = f"https://www.tiktok.com/@{TIKTOK_ACCOUNT}"
-    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_yt.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
     # Шаг 1: получить список видео с аккаунта
@@ -1300,7 +1300,7 @@ async def fetch_meme_pikk() -> tuple:
     import glob
 
     account_url = f"https://www.tiktok.com/@{TIKTOK_PIKK_ACCOUNT}"
-    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_yt.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
     logger.info("TikTok Pikk: получаем список видео @%s", TIKTOK_PIKK_ACCOUNT)
