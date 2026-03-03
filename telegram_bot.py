@@ -91,7 +91,11 @@ logger = logging.getLogger("telegram_bot")
 TRIGGER_MENTION = "orqis"
 TRIGGER_WORD    = "сгк"
 TRIGGER_PATTERN = re.compile(
-    r"@?\s*" + re.escape(TRIGGER_MENTION) + r"\s+.*?" + re.escape(TRIGGER_WORD),
+    r"(?:"
+    r"@?\s*" + re.escape(TRIGGER_MENTION) + r"\s+.*?" + re.escape(TRIGGER_WORD)
+    + r"|"
+    + r"(?<!\w)" + re.escape(TRIGGER_WORD) + r"(?!\w)"
+    + r")",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -212,7 +216,20 @@ async def cmd_trigger(message, bot, backend):
     if not info["has_track"] or (not info["title"] and not info["artist"]):
         raw = _fetch_player_info()
         if not raw:
-            await message.answer("🔌 Плеер недоступен — запусти mp3 player на своём компе.")
+            player_host = PLAYER_URL.replace("http://", "").replace("https://", "").split("/")[0]
+            if "localhost" in player_host or "127.0.0.1" in player_host:
+                await message.answer(
+                    "🔌 Плеер недоступен.\n"
+                    "<i>PLAYER_URL указывает на localhost — бот на Railway не может подключиться к локальному компу.\n"
+                    "Используй ngrok: <code>ngrok http 9988</code> и задай PLAYER_URL в Railway.</i>",
+                    parse_mode="HTML",
+                )
+            else:
+                await message.answer(
+                    f"🔌 Плеер недоступен — запусти mp3 player на своём компе.\n"
+                    f"<code>PLAYER_URL={PLAYER_URL}</code>",
+                    parse_mode="HTML",
+                )
         else:
             await message.answer("Сейчас ничего не играет.")
         return
@@ -2422,7 +2439,7 @@ async def run_bot(backend=None):
         uname    = (user_obj.username or "") if user_obj else ""
         chat_id  = message.chat.id
 
-        if _trigger_matches(text) and user_id == ALLOWED_USER_ID:
+        if _trigger_matches(text):
             be = get_backend()
             await cmd_trigger(message, bot, be)
             return
