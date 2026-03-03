@@ -326,29 +326,33 @@ async def handle_callback(callback, bot, backend):
         return
 
     if data == "download_track":
-        info   = _get_current_track_info(backend)
+        info = _get_current_track_info(backend)
         new_kb = remove_button("download_track")
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=new_kb)
         except Exception as e:
             logger.warning("Не удалось обновить клавиатуру: %s", e)
         await callback.answer()
-        filepath = info.get("filepath") or ""
-        if not filepath or not os.path.isfile(filepath):
-            await bot.send_message(chat_id=chat_id, text="Файл трека недоступен.",
-                                   reply_to_message_id=message_id)
-            return
+
         try:
-            with open(filepath, "rb") as f:
-                audio_bytes = f.read()
+            file_url = f"{PLAYER_URL}/file"
+            headers = {}
+            if "ngrok" in PLAYER_URL.lower():
+                headers["ngrok-skip-browser-warning"] = "1"
+            resp = requests.get(file_url, timeout=30, headers=headers)
+            if resp.status_code != 200:
+                await bot.send_message(chat_id=chat_id, text="Файл трека недоступен.",
+                                    reply_to_message_id=message_id)
+                return
             from aiogram.types import BufferedInputFile
-            audio_file = BufferedInputFile(audio_bytes, filename=os.path.basename(filepath))
+            filename = info.get("title", "track") + ".mp3"
+            audio_file = BufferedInputFile(resp.content, filename=filename)
             await bot.send_audio(chat_id=chat_id, audio=audio_file,
-                                 title=info.get("title"), performer=info.get("artist"))
+                                title=info.get("title"), performer=info.get("artist"))
         except Exception as e:
             logger.exception("Ошибка отправки файла: %s", e)
             await bot.send_message(chat_id=chat_id, text="Не удалось отправить файл.",
-                                   reply_to_message_id=message_id)
+                                reply_to_message_id=message_id)
         return
 
     await callback.answer()
