@@ -894,6 +894,18 @@ async def _youtube_download(query: str) -> tuple:
     if cookies_args:
         logger.info("YouTube: используем cookies_yt.txt")
 
+    if cookies_args and os.path.isfile(cookies_path):
+        try:
+            with open(cookies_path, "rb") as f:
+                raw = f.read()
+            if b"\r\n" in raw:
+                fixed = raw.replace(b"\r\n", b"\n")
+                with open(cookies_path, "wb") as f:
+                    f.write(fixed)
+                logger.info("YouTube: cookies_yt.txt — CRLF исправлен на LF")
+        except Exception as e:
+            logger.warning("YouTube: не удалось исправить line endings: %s", e)
+
     loop = asyncio.get_event_loop()
 
     def _yt_search_and_download():
