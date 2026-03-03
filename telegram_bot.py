@@ -10,7 +10,6 @@ import tempfile
 import time
 from collections import defaultdict
 
-# Загрузка .env при наличии (опционально: pip install python-dotenv)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -18,12 +17,10 @@ except ImportError:
     pass
 
 def _config(key: str, default: str = "") -> str:
-    """Читает значение из: os.environ → .env → bot_config.ini."""
     if key in os.environ and os.environ[key].strip():
         return os.environ[key].strip()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-
     search_dirs = [base_dir, os.path.dirname(base_dir), os.getcwd()]
     for search_dir in search_dirs:
         for env_name in (".env", ".env.local"):
@@ -88,16 +85,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("telegram_bot")
 
-TRIGGER_MENTION = "orqis"
-TRIGGER_WORD    = "сгк"
-TRIGGER_PATTERN = re.compile(
-    r"(?:"
-    r"@?\s*" + re.escape(TRIGGER_MENTION) + r"\s+.*?" + re.escape(TRIGGER_WORD)
-    + r"|"
-    + r"(?<!\w)" + re.escape(TRIGGER_WORD) + r"(?!\w)"
-    + r")",
-    re.IGNORECASE | re.DOTALL,
-)
+TRIGGER_WORD = "сгк"
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -207,7 +195,7 @@ def _decode_cover_to_bytes(cover_data: str):
         return None, None
 
 
-# ── Команда «сгк» ─────────────────────────────────────────────────────────────
+# ── Команда «сгк» (только для владельца по user_id) ──────────────────────────
 
 async def cmd_trigger(message, bot, backend):
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
@@ -461,7 +449,6 @@ HF_MODELS = [
 ]
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 
-# ── Очередь картинок на чат (1 генерация + 40 сек между) ─────────────────────
 DRAW_TRIGGER      = "жужа нарисуй"
 DRAW_COOLDOWN_SEC = 90
 _draw_cooldowns: dict[int, float] = {}
@@ -471,9 +458,8 @@ _draw_queue_busy: dict[int, bool]           = {}
 _draw_last_done:  dict[int, float]          = {}
 
 
-# ── Cobalt: кэш доступных инстансов ──────────────────────────────────────────
+# ── Cobalt ────────────────────────────────────────────────────────────────────
 
-# Все известные инстансы
 _COBALT_ALL_INSTANCES = [
     "https://api.cobalt.tools",
     "https://cobalt.imput.net",
@@ -481,18 +467,12 @@ _COBALT_ALL_INSTANCES = [
     "https://cobalt.tools",
 ]
 
-# Кэш: instance_url → (is_alive: bool, checked_at: float)
-# Мёртвые инстансы не опрашиваются 10 минут
 _cobalt_instance_cache: dict[str, tuple[bool, float]] = {}
-_COBALT_DEAD_TTL = 600   # 10 минут не трогаем мёртвый инстанс
-_COBALT_CHECK_TIMEOUT = 5  # секунд на проверку доступности
+_COBALT_DEAD_TTL = 600
+_COBALT_CHECK_TIMEOUT = 5
 
 
 async def _cobalt_get_live_instances() -> list[str]:
-    """
-    Возвращает только живые инстансы cobalt.
-    Мёртвые пропускаем на _COBALT_DEAD_TTL секунд без повторной проверки.
-    """
     import aiohttp
     now = time.time()
     live = []
@@ -507,10 +487,8 @@ async def _cobalt_get_live_instances() -> list[str]:
                 live.append(inst)
                 continue
             elif age < _COBALT_DEAD_TTL:
-                # Мёртвый и кэш ещё свежий — пропускаем
                 logger.debug("cobalt: пропускаем мёртвый инстанс %s (кэш %ds)", inst, int(age))
                 continue
-        # Нет кэша или кэш устарел — нужно проверить
         to_check.append(inst)
 
     if to_check:
@@ -529,7 +507,6 @@ async def _cobalt_get_live_instances() -> list[str]:
                         timeout=aiohttp.ClientTimeout(total=_COBALT_CHECK_TIMEOUT),
                         allow_redirects=False,
                     ) as resp:
-                        # Любой HTTP-ответ = инстанс жив (даже 405)
                         alive = resp.status not in (502, 503, 504, 0)
                         _cobalt_instance_cache[inst] = (alive, time.time())
                         if alive:
@@ -539,7 +516,6 @@ async def _cobalt_get_live_instances() -> list[str]:
                         return alive
             except Exception as e:
                 err = str(e)[:60]
-                # DNS/connect ошибки = точно мёртв
                 _cobalt_instance_cache[inst] = (False, time.time())
                 logger.info("cobalt: ✗ %s (%s)", inst, err)
                 return False
@@ -549,7 +525,6 @@ async def _cobalt_get_live_instances() -> list[str]:
             if alive:
                 live.append(inst)
 
-    # Убираем дубли, сохраняя порядок
     seen = set()
     unique_live = []
     for inst in live:
@@ -771,24 +746,17 @@ async def _download_image_url(url: str) -> bytes | None:
     return None
 
 
-# ── Скачивание музыки ─────────────────────────────────────────────────────────
+# ── Скачивание музыки (из файла с рабочей музыкой) ───────────────────────────
 
 async def _cobalt_download(query: str) -> tuple:
-    """
-    Скачивает через cobalt.tools API.
-    Сначала проверяет живые инстансы (с кэшированием мёртвых на 10 мин),
-    затем ищет видео через yt-dlp и пробует только живые инстансы.
-    """
     import aiohttp, subprocess as _sp
 
-    # Шаг 0: получаем список живых инстансов
     live_instances = await _cobalt_get_live_instances()
     if not live_instances:
         return None, "cobalt: все инстанции недоступны", None, None
 
     logger.info("cobalt: живых инстансов: %d из %d", len(live_instances), len(set(_COBALT_ALL_INSTANCES)))
 
-    # Шаг 1: найти YouTube ID через поиск
     try:
         result = _sp.run(
             ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s",
@@ -820,7 +788,7 @@ async def _cobalt_download(query: str) -> tuple:
 
     for entry in entries[:3]:
         yt_url = f"https://www.youtube.com/watch?v={entry['id']}"
-        for instance in live_instances:  # только живые!
+        for instance in live_instances:
             try:
                 logger.info("cobalt: %s → %s", instance, entry['title'][:40])
                 async with aiohttp.ClientSession() as session:
@@ -837,7 +805,6 @@ async def _cobalt_download(query: str) -> tuple:
                     ) as resp:
                         if resp.status != 200:
                             logger.info("cobalt %s: HTTP %d", instance, resp.status)
-                            # HTTP 400/405 — инстанс жив, но не принял запрос. Не помечаем мёртвым.
                             continue
                         data = await resp.json(content_type=None)
                         status = data.get("status", "")
@@ -888,16 +855,13 @@ async def _cobalt_download(query: str) -> tuple:
                                         _sh.rmtree(tmpdir, ignore_errors=True)
 
                                 logger.info("✓ cobalt: %dKB '%s'", len(audio_bytes) // 1024, entry['title'][:30])
-                                # Помечаем инстанс как живой
                                 _cobalt_instance_cache[instance] = (True, time.time())
                                 return audio_bytes, entry["title"], entry["uploader"], entry["duration"]
             except asyncio.TimeoutError:
                 logger.info("cobalt %s: таймаут", instance)
-                # Таймаут — возможно временно, не помечаем мёртвым надолго
             except Exception as e:
                 err = str(e)
                 logger.info("cobalt %s: %s", instance, err[:80])
-                # DNS/connect ошибка — помечаем мёртвым
                 if "Name or service not known" in err or "Cannot connect" in err or "No address" in err:
                     _cobalt_instance_cache[instance] = (False, time.time())
                     logger.info("cobalt: помечаем %s как мёртвый на %d мин", instance, _COBALT_DEAD_TTL // 60)
@@ -914,15 +878,13 @@ async def _youtube_download(query: str) -> tuple:
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
     if cookies_args:
         logger.info("YouTube: используем cookies_yt.txt")
-
-    if cookies_args and os.path.isfile(cookies_path):
+        # Фикс CRLF в cookies файле
         try:
             with open(cookies_path, "rb") as f:
                 raw = f.read()
             if b"\r\n" in raw:
-                fixed = raw.replace(b"\r\n", b"\n")
                 with open(cookies_path, "wb") as f:
-                    f.write(fixed)
+                    f.write(raw.replace(b"\r\n", b"\n"))
                 logger.info("YouTube: cookies_yt.txt — CRLF исправлен на LF")
         except Exception as e:
             logger.warning("YouTube: не удалось исправить line endings: %s", e)
@@ -1004,9 +966,6 @@ async def _youtube_download(query: str) -> tuple:
 
 
 async def download_music_by_query(query: str):
-    """
-    Цепочка: [1] Cobalt (только живые инстансы) → [2] YouTube yt-dlp
-    """
     logger.info("Music [1/2]: cobalt.tools → '%s'", query)
     result = await _cobalt_download(query)
     if result[0]:
@@ -1022,7 +981,7 @@ async def download_music_by_query(query: str):
     return None, f"Не удалось скачать: {result[1]}", None, None
 
 
-# ── Поиск изображений (DuckDuckGo) ────────────────────────────────────────────
+# ── Поиск изображений (из файла с рабочим найди) ─────────────────────────────
 
 async def search_image(query: str):
     import aiohttp, re as _re
@@ -1182,10 +1141,6 @@ TIKTOK_PIKK_ACCOUNT = "pikkshannel1"
 
 
 async def fetch_meme_melstroy() -> tuple:
-    """
-    Качает рандомное видео с TikTok-аккаунта footage_me1 без водяного знака.
-    Возвращает (video_bytes, caption) где caption — описание в стиле названия мема.
-    """
     import subprocess
     import glob
 
@@ -1193,7 +1148,6 @@ async def fetch_meme_melstroy() -> tuple:
     cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_yt.txt")
     cookies_args = ["--cookies", cookies_path] if os.path.isfile(cookies_path) else []
 
-    # Шаг 1: получить список видео с аккаунта
     logger.info("TikTok: получаем список видео @%s", TIKTOK_ACCOUNT)
     try:
         result = subprocess.run(
@@ -1219,18 +1173,15 @@ async def fetch_meme_melstroy() -> tuple:
         return None, f"Ошибка: {str(e)[:80]}"
 
     if not lines:
-        # Запасной вариант: попробуем скачать напрямую без листинга
         logger.warning("TikTok: список пустой, пробуем прямой URL аккаунта")
         lines = []
 
     logger.info("TikTok @%s: найдено %d видео", TIKTOK_ACCOUNT, len(lines))
 
-    # Выбираем рандомные видео для попытки скачать
     if lines:
         random.shuffle(lines)
         candidates = lines[:10]
     else:
-        # Если листинг не работает — попробуем скачать сам аккаунт (первые N)
         candidates = [f"__direct__\t@{TIKTOK_ACCOUNT}"]
 
     for entry in candidates:
@@ -1250,12 +1201,10 @@ async def fetch_meme_melstroy() -> tuple:
                 r = subprocess.run(
                     [
                         "yt-dlp",
-                        # Без водяного знака: формат без встроенного вотермарка
                         "-f", "download_addr-2/download_addr/h264/mp4/best",
                         "--no-playlist",
                         "--no-warnings",
                         "--extractor-args", "tiktok:webpage_download=true",
-                        # Пробуем через embed-страницу — обходит watermark
                         "--add-header", "Referer:https://www.tiktok.com/",
                         "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "-o", out_path,
@@ -1281,8 +1230,6 @@ async def fetch_meme_melstroy() -> tuple:
                         continue
 
                     video_bytes = open(fpath, "rb").read()
-
-                    # Формируем подпись в стиле названия мема
                     caption = _make_meme_caption(raw_title)
 
                     logger.info("✓ TikTok мем: %dKB '%s'", len(video_bytes) // 1024, raw_title[:40])
@@ -1299,36 +1246,19 @@ async def fetch_meme_melstroy() -> tuple:
 
 
 def _make_meme_caption(raw_title: str) -> str:
-    """
-    Превращает raw_title из TikTok в красивое описание в стиле названия мема.
-    Убирает хэштеги, лишние символы, делает заглавную букву.
-    """
     if not raw_title:
         return "🎭 мем мелстрой"
-
-    # Убираем хэштеги
     title = re.sub(r"#\w+", "", raw_title)
-    # Убираем @упоминания
     title = re.sub(r"@\w+", "", title)
-    # Убираем лишние пробелы
     title = re.sub(r"\s+", " ", title).strip()
-    # Убираем emoji-мусор в начале/конце (опционально оставляем)
     title = title.strip(".,;:!?-–—")
-
     if not title:
         return "🎭 мем мелстрой"
-
-    # Заглавная буква
     title = title[0].upper() + title[1:] if len(title) > 1 else title.upper()
     return title
 
 
 async def fetch_meme_pikk() -> tuple:
-    """
-    Качает рандомное ВИДЕО (не фото) с TikTok-аккаунта pikkshannel1 без водяного знака.
-    Пропускает посты где только фотографии (несколько медиа без видео).
-    Возвращает (video_bytes, caption).
-    """
     import subprocess
     import glob
 
@@ -1367,7 +1297,7 @@ async def fetch_meme_pikk() -> tuple:
     logger.info("TikTok @%s: найдено %d записей", TIKTOK_PIKK_ACCOUNT, len(lines))
 
     random.shuffle(lines)
-    candidates = lines[:15]  # берём больше — часть могут быть фото
+    candidates = lines[:15]
 
     for entry in candidates:
         parts = entry.split("\t", 3)
@@ -1378,7 +1308,6 @@ async def fetch_meme_pikk() -> tuple:
         ext       = parts[2].strip() if len(parts) > 2 else ""
         duration  = parts[3].strip() if len(parts) > 3 else ""
 
-        # Если из метаданных видно что это изображение — пропускаем
         if ext and ext.lower() in ("jpg", "jpeg", "png", "webp", "gif"):
             logger.info("TikTok Pikk: пропускаем фото %s (ext=%s)", vid_id[:20], ext)
             continue
@@ -1394,7 +1323,6 @@ async def fetch_meme_pikk() -> tuple:
                 r = subprocess.run(
                     [
                         "yt-dlp",
-                        # Явно берём формат с видеодорожкой, mp4
                         "-f", "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best",
                         "--merge-output-format", "mp4",
                         "--no-playlist",
@@ -1418,7 +1346,6 @@ async def fetch_meme_pikk() -> tuple:
                     fpath = files[0]
                     fext  = os.path.splitext(fpath)[1].lower()
 
-                    # Пропускаем если скачалось фото (одно изображение вместо видео)
                     if fext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
                         logger.info("TikTok Pikk: скачалось фото %s, пропускаем", vid_id[:20])
                         continue
@@ -1431,7 +1358,6 @@ async def fetch_meme_pikk() -> tuple:
                         logger.info("TikTok Pikk: файл слишком большой (%dMB), пропускаем", size // 1024 // 1024)
                         continue
 
-                    # Проверяем что в файле есть видеодорожка (не просто аудио)
                     import shutil as _shutil
                     _ffprobe = _shutil.which("ffprobe")
                     if _ffprobe:
@@ -1447,7 +1373,6 @@ async def fetch_meme_pikk() -> tuple:
 
                     video_bytes = open(fpath, "rb").read()
 
-                    # Капшн в стиле пикшанель
                     title = re.sub(r"#\w+", "", raw_title)
                     title = re.sub(r"@\w+", "", title)
                     title = re.sub(r"\s+", " ", title).strip().strip(".,;:!?-–—")
@@ -1694,12 +1619,9 @@ async def juza_chat_reply(chat_id: int, username: str, text: str) -> str | None:
     return reply
 
 
-def _is_admin(user_id: int, username: str | None) -> bool:
-    if user_id == ALLOWED_USER_ID:
-        return True
-    if username and username.lower().lstrip("@") == TRIGGER_MENTION.lower():
-        return True
-    return False
+def _is_admin(user_id: int) -> bool:
+    """Проверка только по user_id — никаких юзернеймов."""
+    return ALLOWED_USER_ID != 0 and user_id == ALLOWED_USER_ID
 
 
 # ── Кэш реп-цитат ─────────────────────────────────────────────────────────────
@@ -1857,7 +1779,7 @@ async def _ad_cache_refresh():
 
 # ── Утилиты ───────────────────────────────────────────────────────────────────
 
-def _trigger_matches(text: str, is_private: bool = False) -> bool:
+def _trigger_matches(text: str) -> bool:
     if not text:
         return False
     return TRIGGER_WORD in text.strip().lower()
@@ -2057,6 +1979,7 @@ async def run_bot(backend=None):
 
         user_id = message.from_user.id if message.from_user else 0
 
+        # Реакция ❤ только на сообщения владельца
         if user_id == ALLOWED_USER_ID and random.random() < 0.10:
             try:
                 await bot.set_message_reaction(
@@ -2066,6 +1989,7 @@ async def run_bot(backend=None):
             except Exception:
                 pass
 
+        # Случайная реакция на любые сообщения
         if random.random() < 0.05:
             try:
                 emoji = random.choice(("❤", "🔥", "👍", "😂", "😢", "🤔", "👀", "💯", "🎉", "❤️‍🔥"))
@@ -2077,6 +2001,16 @@ async def run_bot(backend=None):
                 pass
 
         text = (message.text or "").strip().lower()
+
+        # ── СГК: только владелец по user_id ──────────────────────────────────
+        if _trigger_matches(text):
+            if not _is_admin(user_id):
+                logger.info("сгк: игнорируем user_id=%d (не владелец)", user_id)
+                return  # молча игнорируем
+            be = get_backend()
+            await cmd_trigger(message, bot, be)
+            return
+        # ─────────────────────────────────────────────────────────────────────
 
         if HELP_TRIGGER.lower() in text:
             now  = time.time()
@@ -2443,13 +2377,9 @@ async def run_bot(backend=None):
         uname    = (user_obj.username or "") if user_obj else ""
         chat_id  = message.chat.id
 
-        if _trigger_matches(text):
-            be = get_backend()
-            await cmd_trigger(message, bot, be)
-            return
-
+        # ── Болталка: управление только для владельца по user_id ─────────────
         if CHAT_ON_TRIGGER.lower() in text:
-            if _is_admin(user_id, uname):
+            if _is_admin(user_id):
                 if not _chat_mode_enabled.get(chat_id):
                     _chat_mode_enabled[chat_id] = True
                     _chat_history[chat_id]      = []
@@ -2459,7 +2389,7 @@ async def run_bot(backend=None):
             return
 
         if CHAT_OFF_TRIGGER.lower() in text:
-            if _is_admin(user_id, uname):
+            if _is_admin(user_id):
                 _chat_mode_enabled[chat_id] = False
                 _chat_state_save()
                 logger.info("Болталка ВЫКЛЮЧЕНА в чате %s", chat_id)
