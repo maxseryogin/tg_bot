@@ -121,6 +121,22 @@ def _get_current_track_info(backend=None) -> dict:
 
     if backend is not None:
         try:
+            # Стриминг (YouTube / поиск)
+            streaming_title = getattr(backend, "_streaming_title", "")
+            if streaming_title:
+                lyrics = getattr(backend, "_current_lyrics_text", "") or ""
+                if lyrics.startswith("⏳"):
+                    lyrics = ""
+                return {
+                    "artist":     getattr(backend, "_streaming_artist", ""),
+                    "title":      streaming_title,
+                    "cover_data": getattr(backend, "_streaming_cover", ""),
+                    "lyrics":     lyrics,
+                    "filepath":   "",
+                    "has_track":  True,
+                    "playing":    bool(getattr(backend, "isPlaying", False)),
+                }
+            # Локальная библиотека
             idx = getattr(backend, "current_index", -1)
             if idx is None or idx < 0:
                 return empty
