@@ -1107,8 +1107,8 @@ async def fetch_web_info(query: str) -> str:
                     extract_params = {
                         "action":      "query",
                         "prop":        "extracts",
-                        "exintro":     True,
-                        "explaintext": True,
+                        "exintro":     "1",
+                        "explaintext": "1",
                         "titles":      page_title,
                         "format":      "json",
                         "origin":      "*",
