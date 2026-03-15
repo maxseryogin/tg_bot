@@ -1575,177 +1575,128 @@ async def translate_prompt_to_english(prompt: str) -> str:
     return prompt
 
 
-# ── Жужа-болталка (локальный движок) ─────────────────────────────────────────
+# ── Жужа-болталка (Gemini AI + фолбэк) ───────────────────────────────────────
 
-_JUZA_PHRASES_GENERIC = [
-    "жужа посмотрела на {name}. мозг вышел из чата",
-    "{name} написал и у жужи зависла прошивка. спасибо",
-    "учёные изучали {name}. сдались. закрыли проект",
-    "каждое сообщение {name} — это квест «выживи и не заржи»",
-    "жужа сохранила это. как улику",
-    "{name} пишет и где-то плачет один здравый смысл",
-    "прочитала. осознала. зря",
-    "жужа видела многое. но {name} — это перебор",
-]
-_JUZA_PHRASES_QUESTION = [
-    "{name} хороший вопрос. плохое время. плохая жизнь",
-    "жужа знает ответ. но не уважает вопрос",
-    "вопрос есть. смысла нет",
-    "жужа думала 0.1 секунды и решила что не стоит",
-    "а ты сам как думаешь {name}? вот и не думай",
-    "{name} спросил. вселенная притворилась мёртвой",
-    "42. и хватит с тебя",
-    "ответ потерялся вместе с логикой",
-    "гугл в шоке. жужа тоже",
-    "вопрос принят. отправлен в мусор",
-    "{name} задаёт вопросы как будто жужа бесплатная терапия",
-    "это философия? жужа сегодня в режиме картошки",
-    "хмм. нет. да. нет. всё",
-    "жужа спросила потолок. потолок вышел из диалога",
-]
-_JUZA_PHRASES_SCARY = [
-    "жужа знает где {name} оставил мозг. его там нет",
-    "в 3:47 {name} просыпается. не потому что страшно. а потому что стыдно",
-    "телефон {name} слушает. и смеётся",
-    "жужа читает мысли {name}. там пусто. эхо",
-    "{name} думает что всё под контролем. это мило",
-    "когда {name} выключает свет, интеллект тоже выключается",
-    "{name} в комнате один? интеллект тоже?",
-    "зеркало видело всё. жужа тоже. зеркало в шоке",
-    "кто-то шёл за {name}. это была логика. она устала",
-    "жужа не следит. жужа просто разочарована",
-]
-_JUZA_PHRASES_WALK = [
-    "гулять? воздух не виноват",
-    "вышли гулять? здравый смысл дома забыли?",
-    "гулять — это хорошо. подальше от клавиатуры особенно",
-    "идёте гулять? вернитесь умнее",
-    "прогулка спасёт. может быть. но вряд ли",
-    "гуляйте. жужа отдохнёт от этого",
-    "вышли гулять — отлично. интернету станет легче",
-]
-_JUZA_PHRASES_NO = [
-    "нет сказал {name}. неожиданно разумно",
-    "нет — это редкий проблеск логики",
-    "{name} сказал нет. жужа записала как историческое событие",
-    "нет? впервые поддерживаю",
-    "нет — звучит как победа",
-    "жужа принимает нет. и аплодирует",
-]
-_JUZA_PHRASES_YES = [
-    "да? смело. необдуманно. уважаю",
-    "да сказал {name}. последствия уже идут",
-    "жужа одобряет. частично. случайно",
-    "да? кто тебя этому научил",
-    "принято. потом не ной",
-    "вот это поворот. {name} согласен. мир рушится",
-]
-_JUZA_PHRASES_FOOD = [
-    "еда? мозгу тоже что-нибудь дайте",
-    "кушать идёте? мысль тоже покормите",
-    "жужа слышит слово еда и радуется за ваш единственный стабильный навык",
-    "пожрать — план надёжный. думать сложнее",
-    "еда — единственное что у {name} получается стабильно",
-]
-_JUZA_PHRASES_SLEEP = [
-    "{name} иди спать. мозг перезагрузится. может быть",
-    "сон — твой единственный шанс",
-    "засыпай. хуже уже не станет",
-    "жужа одобряет сон. меньше сообщений",
-    "ложись спать. интернет выдохнет",
-]
-_JUZA_PHRASES_MUSIC = [
-    "музыка — хорошо. она хотя бы со смыслом",
-    "слушаешь трек? он умнее тебя",
-    "музыка спасает. от разговоров особенно",
-    "хороший выбор. удивительно",
-    "жужа бы потанцевала. но стыдно рядом с этим",
-]
-_JUZA_PHRASES_LAUGH = [
-    "смешно? жужа смеётся из жалости",
-    "{name} смеётся. тревожно",
-    "ха. жужа записала это как попытку юмора",
-    "смешно. случайно получилось",
-    "лол. интеллект не пострадал. потому что его нет",
-]
-_JUZA_PHRASES_AGREE = [
-    "жужа согласна. не привыкай",
-    "правильно. впервые",
-    "100%. редкий момент ясности",
-    "согласна. отметим это в календаре",
-    "да. мозг проснулся на секунду",
-]
-_JUZA_PHRASES_BORED = [
-    "скучно? попробуй подумать. нет? ладно",
-    "{name} скучает. логично",
-    "нечего делать? попробуй не писать",
-    "скука — это когда даже жужа устала",
-    "делать нечего? мозг тоже без работы",
+_JUZA_SYSTEM_PROMPT = """Ты — Жужа, дерзкий саркастичный бот в телеграм-чате.
+
+Твой характер:
+- Говоришь коротко: 1-3 предложения максимум, никогда длиннее
+- Острый чёрный юмор, сарказм, иногда абсурд
+- Не используешь смайлы (только изредка если очень в тему)
+- Пишешь строчными буквами, без лишней пунктуации
+- Реагируешь на контекст разговора, не повторяешься
+- Иногда игнорируешь вопрос и говоришь что-то неожиданное
+- Можешь вставить наблюдение про собеседника
+- Не объясняешь шутки, не извиняешься
+- Разговариваешь как живой человек в чате, не как ассистент
+- Знаешь интернет-культуру, мемы, музыку
+
+Запрещено: длинные ответы, нравоучения, официальный тон, одни и те же фразы подряд."""
+
+# Фолбэк-фразы если нет API ключа
+_JUZA_FALLBACK = [
+    "не слышу. наверное к лучшему",
+    "жужа думает. нет. передумала",
+    "и? продолжай. нет, стоп",
+    "это было... что-то",
+    "жужа сохранила как улику",
+    "хм. нет",
+    "ладно",
+    "интересно. нет, не интересно",
+    "жужа видела всякое. но это...",
+    "принято. выброшено",
+    "факт. ненужный факт",
+    "звучит как чья-то проблема",
+    "ок. и что теперь",
+    "жужа кивнула. не потому что согласна",
+    "это был вопрос? жужа не заметила",
+    "мозг промолчал бы. жужа тоже могла",
+    "слушала. пожалела",
+    "записала. удалила",
 ]
 
-_JUZA_PHRASES_CONTEXT = {
-    "гулять":   _JUZA_PHRASES_WALK,
-    "пойдём":   _JUZA_PHRASES_WALK,
-    "идём":     _JUZA_PHRASES_WALK,
-    "прогулк":  _JUZA_PHRASES_WALK,
-    "нет":      _JUZA_PHRASES_NO,
-    "да":       _JUZA_PHRASES_YES,
-    "окей":     _JUZA_PHRASES_YES,
-    "ладно":    _JUZA_PHRASES_YES,
-    "есть":     _JUZA_PHRASES_FOOD,
-    "еда":      _JUZA_PHRASES_FOOD,
-    "кушать":   _JUZA_PHRASES_FOOD,
-    "пожрать":  _JUZA_PHRASES_FOOD,
-    "страшн":   _JUZA_PHRASES_SCARY,
-    "ночь":     _JUZA_PHRASES_SCARY,
-    "темно":    _JUZA_PHRASES_SCARY,
-    "спать":    _JUZA_PHRASES_SLEEP,
-    "сплю":     _JUZA_PHRASES_SLEEP,
-    "засыпаю":  _JUZA_PHRASES_SLEEP,
-    "?":        _JUZA_PHRASES_QUESTION,
-    "музык":    _JUZA_PHRASES_MUSIC,
-    "песн":     _JUZA_PHRASES_MUSIC,
-    "трек":     _JUZA_PHRASES_MUSIC,
-    "слушаю":   _JUZA_PHRASES_MUSIC,
-    "хахах":    _JUZA_PHRASES_LAUGH,
-    "лол":      _JUZA_PHRASES_LAUGH,
-    "ахахах":   _JUZA_PHRASES_LAUGH,
-    "смешн":    _JUZA_PHRASES_LAUGH,
-    "точно":    _JUZA_PHRASES_AGREE,
-    "именно":   _JUZA_PHRASES_AGREE,
-    "согласен": _JUZA_PHRASES_AGREE,
-    "согласна": _JUZA_PHRASES_AGREE,
-    "скучно":   _JUZA_PHRASES_BORED,
-    "скучаю":   _JUZA_PHRASES_BORED,
-    "нечего":   _JUZA_PHRASES_BORED,
-}
 
+async def _juza_gemini_reply(history: list, username: str, text: str) -> str | None:
+    """Запрос к Gemini 1.5 Flash — быстро и бесплатно."""
+    if not GEMINI_API_KEY:
+        return None
+    import aiohttp
 
-def _juza_local_reply(username: str, text: str) -> str:
-    name = username or "незнакомец"
-    t    = text.lower()
-    pool = None
-    for kw, phrases in _JUZA_PHRASES_CONTEXT.items():
-        if kw in t:
-            pool = phrases
-            break
-    if pool is None:
-        pool = _JUZA_PHRASES_SCARY if random.random() < 0.15 else _JUZA_PHRASES_GENERIC
-    return random.choice(pool).format(name=name)
+    # Собираем историю в формат Gemini
+    gemini_messages = []
+    for msg in history[-12:]:  # последние 12 сообщений для контекста
+        role    = "user" if msg["role"] == "user" else "model"
+        content = msg["content"]
+        gemini_messages.append({"role": role, "parts": [{"text": content}]})
+
+    payload = {
+        "system_instruction": {"parts": [{"text": _JUZA_SYSTEM_PROMPT}]},
+        "contents": gemini_messages,
+        "generationConfig": {
+            "temperature":     1.1,
+            "maxOutputTokens": 120,
+            "topP":            0.95,
+        },
+    }
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Gemini chat: HTTP %d — %s", resp.status, body[:120])
+                    return None
+                data = await resp.json(content_type=None)
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    logger.warning("Gemini chat: нет candidates")
+                    return None
+                parts = candidates[0].get("content", {}).get("parts", [])
+                reply = "".join(p.get("text", "") for p in parts).strip()
+                # Убираем кавычки если Gemini обернул ответ в них
+                if reply.startswith('"') and reply.endswith('"'):
+                    reply = reply[1:-1].strip()
+                return reply if reply else None
+    except asyncio.TimeoutError:
+        logger.warning("Gemini chat: таймаут")
+        return None
+    except Exception as e:
+        logger.warning("Gemini chat: ошибка — %s", e)
+        return None
 
 
 async def juza_chat_reply(chat_id: int, username: str, text: str) -> str | None:
-    logger.info("Жужа (локально): %s в чате %s", username, chat_id)
     history      = _chat_history.setdefault(chat_id, [])
     user_content = f"{username}: {text}" if username else text
+
     history.append({"role": "user", "content": user_content})
     while len(history) > _CHAT_HISTORY_MAX:
         history.pop(0)
-    context = " ".join(m["content"] for m in history[-3:])
-    reply   = _juza_local_reply(username, context)
+
+    reply = None
+
+    # ── 1. Пробуем Gemini ─────────────────────────────────────────────────────
+    if GEMINI_API_KEY:
+        reply = await _juza_gemini_reply(history, username, text)
+        if reply:
+            logger.info("Жужа (Gemini): чат %s | %s → %s", chat_id, username, reply[:60])
+
+    # ── 2. Фолбэк — случайная фраза ──────────────────────────────────────────
+    if not reply:
+        reply = random.choice(_JUZA_FALLBACK)
+        logger.info("Жужа (фолбэк): чат %s | %s → %s", chat_id, username, reply)
+
     history.append({"role": "assistant", "content": reply})
     while len(history) > _CHAT_HISTORY_MAX:
         history.pop(0)
+
     return reply
 
 
