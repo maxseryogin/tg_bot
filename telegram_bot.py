@@ -369,6 +369,7 @@ _image_cooldowns  = {}
 _ad_cooldowns     = {}
 _search_cooldowns = {}
 _music_cooldowns  = {}
+_info_cooldowns   = {}
 _help_cooldowns   = {}
 _meme_cooldowns   = {}
 _pikk_cooldowns   = {}
@@ -429,6 +430,9 @@ SEARCH_COOLDOWN_SEC = 30
 MUSIC_TRIGGER       = "жужа музло"
 MUSIC_COOLDOWN_SEC  = 30
 
+INFO_TRIGGER        = "жужа найди информацию"
+INFO_COOLDOWN_SEC   = 30
+
 HELP_TRIGGER        = "жужа шо можешь"
 HELP_COOLDOWN_SEC   = 10
 
@@ -437,6 +441,7 @@ HELP_TEXT = (
     "жужа шо можешь\n"
     "жужа нарисуй [промпт]\n"
     "жужа музло [запрос]\n"
+    "жужа найди информацию [запрос]\n"
     "жужа найди [запрос]\n"
     "жужа цитату\n"
     "жужа го реповать\n"
@@ -1060,6 +1065,115 @@ async def search_image(query: str):
             return None, "не удалось скачать ни одну картинку"
     except Exception as e:
         return None, str(e)[:120]
+
+
+# ── Поиск информации (жужа найди информацию) ─────────────────────────────────
+
+async def fetch_web_info(query: str) -> str:
+    """
+    Ищет информацию по запросу:
+    1. Wikipedia (русская + английская)
+    2. DuckDuckGo Instant Answer API (резервный вариант)
+    Возвращает текстовый ответ или сообщение об ошибке.
+    """
+    import aiohttp, urllib.parse
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; JuzaBot/1.0)"}
+
+    # ── 1. Wikipedia (ru) ─────────────────────────────────────────────────────
+    for lang in ("ru", "en"):
+        try:
+            params = {
+                "action":   "query",
+                "list":     "search",
+                "srsearch": query,
+                "srlimit":  1,
+                "format":   "json",
+                "origin":   "*",
+            }
+            url = f"https://{lang}.wikipedia.org/w/api.php"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+                    results = data.get("query", {}).get("search", [])
+                    if not results:
+                        continue
+                    page_title = results[0]["title"]
+
+                    # Получаем extract страницы
+                    extract_params = {
+                        "action":      "query",
+                        "prop":        "extracts",
+                        "exintro":     True,
+                        "explaintext": True,
+                        "titles":      page_title,
+                        "format":      "json",
+                        "origin":      "*",
+                    }
+                    async with session.get(url, params=extract_params, headers=headers,
+                                           timeout=aiohttp.ClientTimeout(total=8)) as eresp:
+                        if eresp.status != 200:
+                            continue
+                        edata   = await eresp.json(content_type=None)
+                        pages   = edata.get("query", {}).get("pages", {})
+                        extract = ""
+                        for page in pages.values():
+                            extract = (page.get("extract") or "").strip()
+                            break
+                        if extract:
+                            # Обрезаем до ~1200 символов, завершая на точке
+                            if len(extract) > 1200:
+                                cut = extract[:1200]
+                                dot = cut.rfind(".")
+                                extract = cut[: dot + 1] if dot != -1 else cut
+                            wiki_url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(page_title)}"
+                            label = "🇷🇺 Wikipedia" if lang == "ru" else "🇬🇧 Wikipedia"
+                            return (
+                                f"📖 <b>{page_title}</b>\n\n"
+                                f"{extract}\n\n"
+                                f"<a href='{wiki_url}'>{label}</a>"
+                            )
+        except asyncio.TimeoutError:
+            logger.warning("fetch_web_info: Wikipedia %s таймаут", lang)
+        except Exception as e:
+            logger.warning("fetch_web_info: Wikipedia %s ошибка: %s", lang, e)
+
+    # ── 2. DuckDuckGo Instant Answer API (резерв) ─────────────────────────────
+    try:
+        params = {
+            "q":      query,
+            "format": "json",
+            "no_html": "1",
+            "skip_disambig": "1",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.duckduckgo.com/",
+                params=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    abstract = (data.get("AbstractText") or "").strip()
+                    source   = (data.get("AbstractSource") or "").strip()
+                    src_url  = (data.get("AbstractURL") or "").strip()
+                    if abstract:
+                        footer = f"\n\n<a href='{src_url}'>{source}</a>" if src_url else ""
+                        return f"🔎 {abstract}{footer}"
+                    # Related topics fallback
+                    for topic in data.get("RelatedTopics", []):
+                        text = (topic.get("Text") or "").strip()
+                        if text and len(text) > 30:
+                            return f"🔎 {text}"
+    except asyncio.TimeoutError:
+        logger.warning("fetch_web_info: DuckDuckGo таймаут")
+    except Exception as e:
+        logger.warning("fetch_web_info: DuckDuckGo ошибка: %s", e)
+
+    return ""
 
 
 # ── Мем Мелстрой ─────────────────────────────────────────────────────────────
@@ -2341,6 +2455,46 @@ async def run_bot(backend=None):
 
             if not _draw_queue_busy[chat_id]:
                 asyncio.create_task(_draw_queue_worker(chat_id, bot))
+            return
+
+        if INFO_TRIGGER.lower() in text:
+            now  = time.time()
+            last = _info_cooldowns.get(user_id, 0)
+            if now - last < INFO_COOLDOWN_SEC:
+                await message.reply(f"⏱️ Жди ещё {int(INFO_COOLDOWN_SEC - (now - last))} сек.")
+                return
+
+            raw   = message.text or ""
+            idx   = raw.lower().find(INFO_TRIGGER.lower())
+            query = raw[idx + len(INFO_TRIGGER):].strip()
+            if not query:
+                await message.reply(
+                    "Напиши что найти, например:\n<i>жужа найди информацию Никола Тесла</i>",
+                    parse_mode="HTML",
+                )
+                return
+            if len(query) > 200:
+                await message.reply("❌ Запрос слишком длинный (макс 200 символов)")
+                return
+
+            _info_cooldowns[user_id] = now
+            status_msg = await message.reply("🔍 Ищу информацию...")
+            try:
+                result = await fetch_web_info(query)
+                if not result:
+                    await status_msg.edit_text(
+                        f"😔 Ничего не нашла по запросу «{query}»",
+                        parse_mode="HTML",
+                    )
+                    return
+                await status_msg.edit_text(result, parse_mode="HTML",
+                                           disable_web_page_preview=True)
+            except Exception as e:
+                logger.exception("Ошибка поиска информации: %s", e)
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                except Exception:
+                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
             return
 
         if SEARCH_TRIGGER.lower() in text:
