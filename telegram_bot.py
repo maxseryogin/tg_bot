@@ -1349,22 +1349,33 @@ async def _fetch_wiki_extract(query: str) -> tuple[str, str]:
 
 
 async def _juza_info_gemini_reply(query: str, wiki_text: str) -> str | None:
-    """Просит Gemini переформулировать информацию смешно."""
+    """Просит Gemini дать реальную информацию по теме, смешно пересказать."""
     if not GEMINI_API_KEY:
         return None
     import aiohttp
 
     if wiki_text:
-        user_msg = f"Запрос: «{query}»\n\nЧто нашла в Wikipedia:\n{wiki_text}\n\nРасскажи об этом по-своему, смешно и коротко."
+        user_msg = (
+            f"Запрос: «{query}»\n\n"
+            f"Вот что нашла в Wikipedia:\n{wiki_text}\n\n"
+            f"Перескажи это коротко и по-своему, с лёгким юмором. 2-3 предложения. "
+            f"Обязательно включи реальные факты из текста выше."
+        )
     else:
-        user_msg = f"Запрос: «{query}»\n\nВики ничего толкового не нашла. Расскажи сам что знаешь об этом — кратко и с юмором, как будто немного устал от вопроса."
+        user_msg = (
+            f"Запрос: «{query}»\n\n"
+            f"Wikipedia ничего не нашла. Но ты сама знаешь про это — расскажи что знаешь, "
+            f"кратко и с лёгким юмором. 2-3 предложения. "
+            f"Если это человек которого ты не знаешь — скажи об этом смешно но честно. "
+            f"Если это известная вещь/место/событие — расскажи реальные факты."
+        )
 
     payload = {
         "system_instruction": {"parts": [{"text": _INFO_GEMINI_SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
         "generationConfig": {
-            "temperature":     1.2,
-            "maxOutputTokens": 200,
+            "temperature":     1.1,
+            "maxOutputTokens": 250,
             "topP":            0.95,
         },
     }
@@ -1375,8 +1386,10 @@ async def _juza_info_gemini_reply(query: str, wiki_text: str) -> str | None:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("_juza_info_gemini_reply: HTTP %d — %s", resp.status, body[:120])
                     return None
                 data = await resp.json(content_type=None)
                 candidates = data.get("candidates", [])
@@ -1384,9 +1397,12 @@ async def _juza_info_gemini_reply(query: str, wiki_text: str) -> str | None:
                     return None
                 parts = candidates[0].get("content", {}).get("parts", [])
                 reply = "".join(p.get("text", "") for p in parts).strip()
+                # Убираем кавычки если Gemini обернул ответ в них
                 if reply.startswith('"') and reply.endswith('"'):
                     reply = reply[1:-1].strip()
-                return reply if reply else None
+                # Убираем markdown символы
+                reply = reply.replace("**", "").replace("*", "").replace("#", "")
+                return reply if len(reply) > 5 else None
     except Exception as e:
         logger.warning("_juza_info_gemini_reply: %s", e)
         return None
@@ -1394,19 +1410,26 @@ async def _juza_info_gemini_reply(query: str, wiki_text: str) -> str | None:
 
 async def fetch_web_info(query: str) -> str:
     """
-    Ищет информацию по запросу через Wikipedia, потом просит Gemini
-    переформулировать это смешно в стиле жужи. Всегда отвечает.
+    Ищет информацию через Wikipedia, затем просит Gemini пересказать смешно.
+    Всегда возвращает непустую строку.
     """
-    # Пробуем достать факты из Wikipedia
+    # Пробуем Wikipedia
     title, extract = await _fetch_wiki_extract(query)
 
-    # Просим Gemini сделать смешной ответ на основе найденного
+    # Если Wikipedia нашла — Gemini пересказывает смешно
+    # Если не нашла — Gemini отвечает из своих знаний
     funny_reply = await _juza_info_gemini_reply(query, extract)
 
     if funny_reply:
         return funny_reply
 
-    # Фолбэк — случайная смешная фраза
+    # Если Gemini недоступен но Wikipedia что-то нашла — возвращаем Wikipedia напрямую
+    if extract:
+        short = extract[:300]
+        dot = short.rfind(".")
+        return short[:dot + 1] if dot != -1 else short
+
+    # Последний фолбэк
     return random.choice(_INFO_FUNNY_FALLBACKS)
 
 
