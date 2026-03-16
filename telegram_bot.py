@@ -462,6 +462,24 @@ MEME_COOLDOWN_SEC = 60
 MEME_PIKK_TRIGGER      = "жужа мем пикшанель"
 MEME_PIKK_COOLDOWN_SEC = 60
 
+_INFO_GIF_POOL = [
+    "https://media.giphy.com/media/3o7TKMt1VVNkHV2PaE/giphy.gif",
+    "https://media.giphy.com/media/l3q2K5jinAlChoCLS/giphy.gif",
+    "https://media.giphy.com/media/26ufdipQqU2lhNA4g/giphy.gif",
+    "https://media.giphy.com/media/l46CyJmS9KUbokzsI/giphy.gif",
+    "https://media.giphy.com/media/3oEjI6SIIHBdRxXI40/giphy.gif",
+    "https://media.giphy.com/media/l0HlvtIPzPdt2usKs/giphy.gif",
+    "https://media.giphy.com/media/xT9IgG50Lg7russbDB/giphy.gif",
+    "https://media.giphy.com/media/26BRuo6sLetdllPAQ/giphy.gif",
+    "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
+    "https://media.giphy.com/media/3o7TKF5DnsSLv4zVBu/giphy.gif",
+    "https://media.giphy.com/media/l4FGuhL4U2WyjdkaY/giphy.gif",
+    "https://media.giphy.com/media/xT9IgDEI1iZs0tIBnW/giphy.gif",
+    "https://media.giphy.com/media/3ohzdIuqJoo8QdKlnW/giphy.gif",
+    "https://media.giphy.com/media/l0MYEqEzwMWFCg8rm/giphy.gif",
+    "https://media.giphy.com/media/26uflVGKNTNgBdCra/giphy.gif",
+]
+
 HF_MODELS = [
     "stabilityai/stable-diffusion-3.5-medium",
     "black-forest-labs/FLUX.1-schnell",
@@ -1256,32 +1274,24 @@ async def search_image(query: str):
 # ── Поиск информации (жужа найди информацию) ─────────────────────────────────
 
 _INFO_FUNNY_FALLBACKS = [
-    "короче гугл говорит что это что-то важное но я не читала",
-    "вики пишет много умных слов, смысл — непонятно",
-    "нашла инфу, прочитала, ничего не поняла, тебе тоже не скажу",
-    "это настолько сложная тема что я сделала вид что ищу и легла спать",
-    "спросила у умных людей — они ушли",
-    "Wikipedia говорит одно, интернет говорит другое, я верю ни тем ни другим",
-    "нашла 47 источников. все противоречат друг другу. удачи",
-    "информация есть но она вся скучная поэтому я её не принесла",
-    "по этой теме написано 3 книги, 2 диссертации и 1 пост в вк. пост врёт",
-    "ок я нашла но это слишком умно для этого чата",
-    "ищу... ищу... нашла... потеряла",
-    "тема интересная но объяснять лень",
-    "всё что ты хотел знать об этом — на первой странице гугла. я не первая страница",
-    "мне кажется ты сам знаешь ответ просто хочешь чтоб я подтвердила",
-    "нашла статью на 40 страниц. прочитала заголовок. зачёт",
+    "нашла, но пока несла — потеряла",
+    "вики упала, гугл молчит, я сдалась",
+    "информация засекречена. кем? мной",
+    "пробовала найти — сломала интернет",
+    "ничего не нашла но выгляжу уверенно",
 ]
 
 _INFO_GEMINI_SYSTEM = (
     "Ты — жужа, смешной и немного дерзкий телеграм-бот. Тебя попросили найти информацию. "
-    "Ты действительно нашла её (в Wikipedia или интернете) и теперь рассказываешь — но по-своему: "
+    "Ты нашла её и теперь ОБЯЗАТЕЛЬНО рассказываешь реальные факты — но по-своему: "
     "кратко, с юмором, иногда саркастично, иногда удивлённо. "
-    "Отвечай на русском, 2-4 предложения максимум. "
-    "Можешь добавить смешной комментарий от себя в конце. "
-    "Не используй markdown. Не пиши 'Wikipedia говорит' буквально — перефразируй по-своему. "
-    "Если тема странная или не по теме — ответь в духе 'ну окей раз надо' и расскажи что-нибудь реальное про это. "
-    "Всегда отвечай, никогда не говори что не знаешь."
+    "ВАЖНО: ты ВСЕГДА пишешь реальную информацию по теме, никогда не отказываешься. "
+    "Отвечай на русском, 2-4 предложения. "
+    "Можешь добавить короткий смешной комментарий от себя в конце. "
+    "Не используй markdown, звёздочки, решётки. "
+    "Не пиши 'Wikipedia говорит' — перефразируй по-своему. "
+    "Если тема странная — расскажи что-нибудь реальное про это с удивлённым тоном. "
+    "НИКОГДА не пиши что не знаешь или что не можешь найти — просто расскажи факты."
 )
 
 
@@ -2749,45 +2759,20 @@ async def run_bot(backend=None):
                 return
 
             _info_cooldowns[user_id] = now
-
-            # 20% шанс ответить GIF вместо текста
-            if random.random() < 0.20:
-                _INFO_GIF_POOL = [
-                    "https://media.giphy.com/media/3o7TKMt1VVNkHV2PaE/giphy.gif",
-                    "https://media.giphy.com/media/l3q2K5jinAlChoCLS/giphy.gif",
-                    "https://media.giphy.com/media/26ufdipQqU2lhNA4g/giphy.gif",
-                    "https://media.giphy.com/media/l46CyJmS9KUbokzsI/giphy.gif",
-                    "https://media.giphy.com/media/3oEjI6SIIHBdRxXI40/giphy.gif",
-                    "https://media.giphy.com/media/l0HlvtIPzPdt2usKs/giphy.gif",
-                    "https://media.giphy.com/media/xT9IgG50Lg7russbDB/giphy.gif",
-                    "https://media.giphy.com/media/26BRuo6sLetdllPAQ/giphy.gif",
-                    "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
-                    "https://media.giphy.com/media/3o7TKF5DnsSLv4zVBu/giphy.gif",
-                ]
-                gif_url = random.choice(_INFO_GIF_POOL)
-                _gif_captions = [
-                    f"вот всё что тебе надо знать про «{query}»",
-                    f"нашла инфу по запросу «{query}»",
-                    f"краткая справка: «{query}»",
-                    f"держи, это всё объясняет",
-                    f"изучай",
-                ]
-                try:
-                    await message.reply_animation(
-                        animation=gif_url,
-                        caption=random.choice(_gif_captions),
-                    )
-                except Exception:
-                    await message.reply(random.choice(_gif_captions))
-                return
-
             status_msg = await message.reply("🔍 Ищу информацию...")
             try:
                 result = await fetch_web_info(query)
                 if not result:
                     result = random.choice(_INFO_FUNNY_FALLBACKS)
-                await status_msg.edit_text(result, parse_mode="HTML",
-                                           disable_web_page_preview=True)
+                gif_url = random.choice(_INFO_GIF_POOL)
+                try:
+                    await message.reply_animation(animation=gif_url, caption=result)
+                except Exception:
+                    await message.reply(result)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             except Exception as e:
                 logger.exception("Ошибка поиска информации: %s", e)
                 try:
@@ -2883,6 +2868,22 @@ async def run_bot(backend=None):
             reply_text  = await juza_chat_reply(chat_id, sender_name, message.text or "")
             if reply_text:
                 await message.reply(reply_text)
+            return
+
+        # 20% шанс: жужа сама берёт текст сообщения как запрос и отвечает с GIF + инфой
+        if random.random() < 0.20:
+            spontaneous_query = (message.text or "").strip()
+            if spontaneous_query and len(spontaneous_query) <= 200:
+                try:
+                    result = await fetch_web_info(spontaneous_query)
+                    if result:
+                        gif_url = random.choice(_INFO_GIF_POOL)
+                        try:
+                            await message.reply_animation(animation=gif_url, caption=result)
+                        except Exception:
+                            await message.reply(result)
+                except Exception as e:
+                    logger.warning("Спонтанная инфо-реакция: %s", e)
 
     @dp.callback_query()
     async def on_callback(callback: CallbackQuery):
