@@ -440,6 +440,7 @@ HELP_TEXT = (
     "<pre>"
     "жужа шо можешь\n"
     "жужа нарисуй [промпт]\n"
+    "жужа кружок [ссылка на видео]\n"
     "жужа музло [запрос]\n"
     "жужа найди информацию [запрос]\n"
     "жужа найди [запрос]\n"
@@ -473,6 +474,11 @@ HF_API_URL = "https://router.huggingface.co/hf-inference/models/{}"
 DRAW_TRIGGER      = "жужа нарисуй"
 DRAW_COOLDOWN_SEC = 90
 _draw_cooldowns: dict[int, float] = {}
+
+CIRCLE_TRIGGER       = "жужа кружок"
+CIRCLE_COOLDOWN_SEC  = 30
+_circle_cooldowns: dict[int, float] = {}
+CIRCLE_MAX_DURATION  = 60  # секунд — ограничение Telegram для video note
 
 _draw_queues:     dict[int, asyncio.Queue]  = {}
 _draw_queue_busy: dict[int, bool]           = {}
@@ -765,6 +771,186 @@ async def _download_image_url(url: str) -> bytes | None:
     except Exception as e:
         logger.warning("_download_image_url: %s", str(e)[:80])
     return None
+
+
+# ── Видео-кружок ─────────────────────────────────────────────────────────────
+
+async def download_video_for_circle(url: str) -> tuple[bytes | None, str]:
+    """Скачивает видео по URL и конвертирует его в квадратный формат для video note.
+    
+    Возвращает (bytes, error_or_title).
+    Видео обрезается до CIRCLE_MAX_DURATION секунд и приводится к квадрату 360×360.
+    """
+    import aiohttp
+    import subprocess as _sp
+    import shutil
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    yt_dlp_path = shutil.which("yt-dlp")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_path  = os.path.join(tmpdir, "raw_video")
+        out_path  = os.path.join(tmpdir, "circle.mp4")
+
+        # ── 1. Попытка скачать через yt-dlp (YouTube, VK, TikTok и т.д.) ──
+        if yt_dlp_path:
+            try:
+                result = _sp.run(
+                    [
+                        yt_dlp_path,
+                        "--no-playlist",
+                        "--merge-output-format", "mp4",
+                        "-f", "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                        "--max-filesize", "50M",
+                        "-o", raw_path + ".%(ext)s",
+                        url,
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
+                # yt-dlp добавляет расширение — ищем файл
+                downloaded = None
+                for ext in ("mp4", "mkv", "webm", "avi", "mov"):
+                    candidate = raw_path + f".{ext}"
+                    if os.path.isfile(candidate):
+                        downloaded = candidate
+                        break
+                if downloaded is None:
+                    # иногда файл без расширения
+                    for fname in os.listdir(tmpdir):
+                        if fname.startswith("raw_video"):
+                            downloaded = os.path.join(tmpdir, fname)
+                            break
+                if downloaded:
+                    raw_path = downloaded
+                    logger.info("circle: yt-dlp скачал %s (%dKB)", downloaded,
+                                os.path.getsize(downloaded) // 1024)
+                else:
+                    logger.warning("circle: yt-dlp не нашёл файл; stderr=%s",
+                                   result.stderr[:200])
+                    raw_path = None
+            except _sp.TimeoutExpired:
+                logger.warning("circle: yt-dlp таймаут")
+                raw_path = None
+            except Exception as e:
+                logger.warning("circle: yt-dlp ошибка: %s", e)
+                raw_path = None
+        else:
+            raw_path = None
+
+        # ── 2. Если yt-dlp не помог — прямой HTTP-запрос ──────────────────
+        if raw_path is None:
+            direct_path = os.path.join(tmpdir, "direct.mp4")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=60),
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    ) as resp:
+                        if resp.status != 200:
+                            return None, f"HTTP {resp.status} при скачивании видео"
+                        content = await resp.read()
+                if len(content) < 1000:
+                    return None, "Файл слишком маленький — возможно, это не видео"
+                with open(direct_path, "wb") as f:
+                    f.write(content)
+                raw_path = direct_path
+                logger.info("circle: прямое скачивание %dKB", len(content) // 1024)
+            except Exception as e:
+                return None, f"Не удалось скачать видео: {str(e)[:100]}"
+
+        if not raw_path or not os.path.isfile(raw_path):
+            return None, "Не удалось скачать видео"
+
+        # ── 3. Конвертация в квадрат 360×360 через ffmpeg ─────────────────
+        if not ffmpeg_path:
+            # Нет ffmpeg — отправляем как есть (может не пройти ограничение кружка)
+            logger.warning("circle: ffmpeg не найден, отправляем без конвертации")
+            with open(raw_path, "rb") as f:
+                return f.read(), ""
+
+        try:
+            _sp.run(
+                [
+                    ffmpeg_path,
+                    "-y",                           # перезаписать
+                    "-i", raw_path,
+                    "-t", str(CIRCLE_MAX_DURATION), # обрезать до 60 сек
+                    # Масштабируем и центрируем, заполняя квадрат 360×360
+                    "-vf", (
+                        "scale=360:360:force_original_aspect_ratio=increase,"
+                        "crop=360:360"
+                    ),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "28",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    "-movflags", "+faststart",
+                    out_path,
+                ],
+                capture_output=True, text=True, timeout=180,
+                check=True,
+            )
+            logger.info("circle: ffmpeg конвертировал → %dKB",
+                        os.path.getsize(out_path) // 1024)
+            with open(out_path, "rb") as f:
+                return f.read(), ""
+        except _sp.CalledProcessError as e:
+            logger.warning("circle: ffmpeg ошибка: %s", e.stderr[-300:])
+            # Попробуем отдать оригинал
+            with open(raw_path, "rb") as f:
+                return f.read(), "без конвертации (ffmpeg не справился)"
+        except _sp.TimeoutExpired:
+            return None, "ffmpeg таймаут при конвертации"
+        except Exception as e:
+            return None, f"Ошибка конвертации: {str(e)[:100]}"
+
+
+async def _convert_to_circle_bytes(raw_bytes: bytes) -> tuple[bytes | None, str]:
+    """Конвертирует сырые байты видео в квадрат 360×360 для video note через ffmpeg."""
+    import subprocess as _sp
+    import shutil
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        logger.warning("circle: ffmpeg не найден, отправляем без конвертации")
+        return raw_bytes, ""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path  = os.path.join(tmpdir, "input.mp4")
+        out_path = os.path.join(tmpdir, "circle.mp4")
+        with open(in_path, "wb") as f:
+            f.write(raw_bytes)
+        try:
+            _sp.run(
+                [
+                    ffmpeg_path, "-y",
+                    "-i", in_path,
+                    "-t", str(CIRCLE_MAX_DURATION),
+                    "-vf", (
+                        "scale=360:360:force_original_aspect_ratio=increase,"
+                        "crop=360:360"
+                    ),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "28",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    "-movflags", "+faststart",
+                    out_path,
+                ],
+                capture_output=True, text=True, timeout=180, check=True,
+            )
+            with open(out_path, "rb") as f:
+                return f.read(), ""
+        except _sp.CalledProcessError as e:
+            logger.warning("circle: ffmpeg ошибка: %s", e.stderr[-300:])
+            return raw_bytes, "без конвертации (ffmpeg не справился)"
+        except _sp.TimeoutExpired:
+            return None, "ffmpeg таймаут"
+        except Exception as e:
+            return None, f"Ошибка конвертации: {str(e)[:100]}"
 
 
 # ── Скачивание музыки (из файла с рабочей музыкой) ───────────────────────────
@@ -2368,6 +2554,102 @@ async def run_bot(backend=None):
                     await message.reply(f"❌ Ошибка: {str(e)[:200]}")
             return
 
+        if CIRCLE_TRIGGER.lower() in text:
+            now  = time.time()
+            last = _circle_cooldowns.get(user_id, 0)
+            if now - last < CIRCLE_COOLDOWN_SEC:
+                await message.reply(f"⏱️ Жди ещё {int(CIRCLE_COOLDOWN_SEC - (now - last))} сек.")
+                return
+
+            raw     = message.text or ""
+            idx     = raw.lower().find(CIRCLE_TRIGGER.lower())
+            url_raw = raw[idx + len(CIRCLE_TRIGGER):].strip()
+
+            # ── Определяем источник видео ─────────────────────────────────
+            # 1. Видео прикреплено к этому же сообщению (caption + video)
+            # 2. Это ответ на сообщение с видео/документом-видео/video_note
+            # 3. URL в тексте
+
+            video_file_id = None
+
+            # Случай 1: видео прикреплено к сообщению с триггером (обрабатывается
+            #   хендлером on_video_with_caption — см. ниже). Здесь этого не будет,
+            #   т.к. on_text срабатывает только на F.text (без медиа).
+            #   Поэтому смотрим только reply.
+
+            # Случай 2: reply на видео
+            reply_msg = message.reply_to_message
+            if reply_msg:
+                if reply_msg.video:
+                    video_file_id = reply_msg.video.file_id
+                elif reply_msg.document and reply_msg.document.mime_type and \
+                        reply_msg.document.mime_type.startswith("video"):
+                    video_file_id = reply_msg.document.file_id
+                elif reply_msg.video_note:
+                    video_file_id = reply_msg.video_note.file_id
+
+            # Случай 3: URL в тексте
+            video_url = None
+            if not video_file_id and url_raw:
+                candidate = url_raw.split()[0]
+                if candidate.startswith(("http://", "https://")):
+                    video_url = candidate
+
+            if not video_file_id and not video_url:
+                await message.reply(
+                    "Как использовать:\n"
+                    "• <b>Ответь</b> на видео в чате командой <i>жужа кружок</i>\n"
+                    "• Или напиши ссылку: <i>жужа кружок https://youtu.be/...</i>\n\n"
+                    "📌 YouTube, TikTok, VK и прямые mp4-ссылки.\n"
+                    f"⏱ Видео обрезается до {CIRCLE_MAX_DURATION} сек.",
+                    parse_mode="HTML",
+                )
+                return
+
+            _circle_cooldowns[user_id] = now
+            status_msg = await message.reply("🎥 Обрабатываю видео...")
+            try:
+                from aiogram.types import BufferedInputFile
+
+                if video_file_id:
+                    # Скачиваем файл из Telegram
+                    tg_file = await bot.get_file(video_file_id)
+                    tg_bytes = await bot.download_file(tg_file.file_path)
+                    raw_bytes = tg_bytes.read() if hasattr(tg_bytes, "read") else bytes(tg_bytes)
+                    logger.info("circle: получен файл из TG %dKB", len(raw_bytes) // 1024)
+                    # Конвертируем через ffmpeg
+                    video_bytes, warn = await _convert_to_circle_bytes(raw_bytes)
+                else:
+                    video_bytes, warn = await download_video_for_circle(video_url)
+
+                if not video_bytes:
+                    await status_msg.edit_text(f"❌ Не получилось: {warn}")
+                    return
+
+                MAX_BYTES = 49 * 1024 * 1024
+                if len(video_bytes) > MAX_BYTES:
+                    await status_msg.edit_text(
+                        f"❌ Видео слишком большое ({len(video_bytes) // (1024*1024)} МБ > 49 МБ)"
+                    )
+                    return
+
+                vf = BufferedInputFile(video_bytes, filename="circle.mp4")
+                await message.reply_video_note(video_note=vf)
+                if warn:
+                    await message.reply(f"⚠️ {warn}")
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                logger.info("circle: отправлен кружок %dKB", len(video_bytes) // 1024)
+            except Exception as e:
+                logger.exception("Ошибка отправки кружка: %s", e)
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:150]}")
+                except Exception:
+                    await message.reply(f"❌ Ошибка: {str(e)[:150]}")
+            return
+
         if DRAW_TRIGGER.lower() in text:
             chat_id = message.chat.id
 
@@ -2540,6 +2822,66 @@ async def run_bot(backend=None):
     async def on_callback(callback: CallbackQuery):
         be = get_backend()
         await handle_callback(callback, bot, be)
+
+    @dp.message(F.video | F.document)
+    async def on_video_with_caption(message: Message):
+        """Обрабатывает видео, отправленное вместе с триггером в подписи (caption)."""
+        caption = (message.caption or "").strip().lower()
+        if CIRCLE_TRIGGER.lower() not in caption:
+            return
+
+        user_id = message.from_user.id if message.from_user else 0
+        now  = time.time()
+        last = _circle_cooldowns.get(user_id, 0)
+        if now - last < CIRCLE_COOLDOWN_SEC:
+            await message.reply(f"⏱️ Жди ещё {int(CIRCLE_COOLDOWN_SEC - (now - last))} сек.")
+            return
+
+        # Проверяем что это видео (video или document с mime video/*)
+        if message.video:
+            file_id = message.video.file_id
+        elif message.document and message.document.mime_type and \
+                message.document.mime_type.startswith("video"):
+            file_id = message.document.file_id
+        else:
+            return
+
+        _circle_cooldowns[user_id] = now
+        status_msg = await message.reply("🎥 Обрабатываю видео...")
+        try:
+            from aiogram.types import BufferedInputFile
+            tg_file  = await bot.get_file(file_id)
+            tg_bytes = await bot.download_file(tg_file.file_path)
+            raw_bytes = tg_bytes.read() if hasattr(tg_bytes, "read") else bytes(tg_bytes)
+            logger.info("circle(caption): получен файл %dKB", len(raw_bytes) // 1024)
+
+            video_bytes, warn = await _convert_to_circle_bytes(raw_bytes)
+            if not video_bytes:
+                await status_msg.edit_text(f"❌ Не получилось: {warn}")
+                return
+
+            MAX_BYTES = 49 * 1024 * 1024
+            if len(video_bytes) > MAX_BYTES:
+                await status_msg.edit_text(
+                    f"❌ Видео слишком большое ({len(video_bytes) // (1024*1024)} МБ > 49 МБ)"
+                )
+                return
+
+            vf = BufferedInputFile(video_bytes, filename="circle.mp4")
+            await message.reply_video_note(video_note=vf)
+            if warn:
+                await message.reply(f"⚠️ {warn}")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            logger.info("circle(caption): отправлен кружок %dKB", len(video_bytes) // 1024)
+        except Exception as e:
+            logger.exception("Ошибка кружка из caption: %s", e)
+            try:
+                await status_msg.edit_text(f"❌ Ошибка: {str(e)[:150]}")
+            except Exception:
+                await message.reply(f"❌ Ошибка: {str(e)[:150]}")
 
     logger.info("Бот запущен")
     logger.info(
