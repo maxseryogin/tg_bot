@@ -1255,18 +1255,40 @@ async def search_image(query: str):
 
 # ── Поиск информации (жужа найди информацию) ─────────────────────────────────
 
-async def fetch_web_info(query: str) -> str:
-    """
-    Ищет информацию по запросу:
-    1. Wikipedia (русская + английская)
-    2. DuckDuckGo Instant Answer API (резервный вариант)
-    Возвращает текстовый ответ или сообщение об ошибке.
-    """
+_INFO_FUNNY_FALLBACKS = [
+    "короче гугл говорит что это что-то важное но я не читала",
+    "вики пишет много умных слов, смысл — непонятно",
+    "нашла инфу, прочитала, ничего не поняла, тебе тоже не скажу",
+    "это настолько сложная тема что я сделала вид что ищу и легла спать",
+    "спросила у умных людей — они ушли",
+    "Wikipedia говорит одно, интернет говорит другое, я верю ни тем ни другим",
+    "нашла 47 источников. все противоречат друг другу. удачи",
+    "информация есть но она вся скучная поэтому я её не принесла",
+    "по этой теме написано 3 книги, 2 диссертации и 1 пост в вк. пост врёт",
+    "ок я нашла но это слишком умно для этого чата",
+    "ищу... ищу... нашла... потеряла",
+    "тема интересная но объяснять лень",
+    "всё что ты хотел знать об этом — на первой странице гугла. я не первая страница",
+    "мне кажется ты сам знаешь ответ просто хочешь чтоб я подтвердила",
+    "нашла статью на 40 страниц. прочитала заголовок. зачёт",
+]
+
+_INFO_GEMINI_SYSTEM = (
+    "Ты — жужа, смешной и немного дерзкий телеграм-бот. Тебя попросили найти информацию. "
+    "Ты действительно нашла её (в Wikipedia или интернете) и теперь рассказываешь — но по-своему: "
+    "кратко, с юмором, иногда саркастично, иногда удивлённо. "
+    "Отвечай на русском, 2-4 предложения максимум. "
+    "Можешь добавить смешной комментарий от себя в конце. "
+    "Не используй markdown. Не пиши 'Wikipedia говорит' буквально — перефразируй по-своему. "
+    "Если тема странная или не по теме — ответь в духе 'ну окей раз надо' и расскажи что-нибудь реальное про это. "
+    "Всегда отвечай, никогда не говори что не знаешь."
+)
+
+
+async def _fetch_wiki_extract(query: str) -> tuple[str, str]:
+    """Возвращает (title, extract) из Wikipedia (ru потом en), или ('', '')."""
     import aiohttp, urllib.parse
-
     headers = {"User-Agent": "Mozilla/5.0 (compatible; JuzaBot/1.0)"}
-
-    # ── 1. Wikipedia (ru) ─────────────────────────────────────────────────────
     for lang in ("ru", "en"):
         try:
             params = {
@@ -1288,8 +1310,6 @@ async def fetch_web_info(query: str) -> str:
                     if not results:
                         continue
                     page_title = results[0]["title"]
-
-                    # Получаем extract страницы
                     extract_params = {
                         "action":      "query",
                         "prop":        "extracts",
@@ -1303,63 +1323,81 @@ async def fetch_web_info(query: str) -> str:
                                            timeout=aiohttp.ClientTimeout(total=8)) as eresp:
                         if eresp.status != 200:
                             continue
-                        edata   = await eresp.json(content_type=None)
-                        pages   = edata.get("query", {}).get("pages", {})
-                        extract = ""
+                        edata = await eresp.json(content_type=None)
+                        pages = edata.get("query", {}).get("pages", {})
                         for page in pages.values():
                             extract = (page.get("extract") or "").strip()
-                            break
-                        if extract:
-                            # Обрезаем до ~1200 символов, завершая на точке
-                            if len(extract) > 1200:
-                                cut = extract[:1200]
-                                dot = cut.rfind(".")
-                                extract = cut[: dot + 1] if dot != -1 else cut
-                            wiki_url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(page_title)}"
-                            label = "🇷🇺 Wikipedia" if lang == "ru" else "🇬🇧 Wikipedia"
-                            return (
-                                f"📖 <b>{page_title}</b>\n\n"
-                                f"{extract}\n\n"
-                                f"<a href='{wiki_url}'>{label}</a>"
-                            )
-        except asyncio.TimeoutError:
-            logger.warning("fetch_web_info: Wikipedia %s таймаут", lang)
+                            if extract:
+                                if len(extract) > 800:
+                                    cut = extract[:800]
+                                    dot = cut.rfind(".")
+                                    extract = cut[:dot + 1] if dot != -1 else cut
+                                return page_title, extract
         except Exception as e:
-            logger.warning("fetch_web_info: Wikipedia %s ошибка: %s", lang, e)
+            logger.warning("fetch_wiki: %s ошибка: %s", lang, e)
+    return "", ""
 
-    # ── 2. DuckDuckGo Instant Answer API (резерв) ─────────────────────────────
+
+async def _juza_info_gemini_reply(query: str, wiki_text: str) -> str | None:
+    """Просит Gemini переформулировать информацию смешно."""
+    if not GEMINI_API_KEY:
+        return None
+    import aiohttp
+
+    if wiki_text:
+        user_msg = f"Запрос: «{query}»\n\nЧто нашла в Wikipedia:\n{wiki_text}\n\nРасскажи об этом по-своему, смешно и коротко."
+    else:
+        user_msg = f"Запрос: «{query}»\n\nВики ничего толкового не нашла. Расскажи сам что знаешь об этом — кратко и с юмором, как будто немного устал от вопроса."
+
+    payload = {
+        "system_instruction": {"parts": [{"text": _INFO_GEMINI_SYSTEM}]},
+        "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+        "generationConfig": {
+            "temperature":     1.2,
+            "maxOutputTokens": 200,
+            "topP":            0.95,
+        },
+    }
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
     try:
-        params = {
-            "q":      query,
-            "format": "json",
-            "no_html": "1",
-            "skip_disambig": "1",
-        }
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.duckduckgo.com/",
-                params=params, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    abstract = (data.get("AbstractText") or "").strip()
-                    source   = (data.get("AbstractSource") or "").strip()
-                    src_url  = (data.get("AbstractURL") or "").strip()
-                    if abstract:
-                        footer = f"\n\n<a href='{src_url}'>{source}</a>" if src_url else ""
-                        return f"🔎 {abstract}{footer}"
-                    # Related topics fallback
-                    for topic in data.get("RelatedTopics", []):
-                        text = (topic.get("Text") or "").strip()
-                        if text and len(text) > 30:
-                            return f"🔎 {text}"
-    except asyncio.TimeoutError:
-        logger.warning("fetch_web_info: DuckDuckGo таймаут")
+            async with session.post(url, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    return None
+                parts = candidates[0].get("content", {}).get("parts", [])
+                reply = "".join(p.get("text", "") for p in parts).strip()
+                if reply.startswith('"') and reply.endswith('"'):
+                    reply = reply[1:-1].strip()
+                return reply if reply else None
     except Exception as e:
-        logger.warning("fetch_web_info: DuckDuckGo ошибка: %s", e)
+        logger.warning("_juza_info_gemini_reply: %s", e)
+        return None
 
-    return ""
+
+async def fetch_web_info(query: str) -> str:
+    """
+    Ищет информацию по запросу через Wikipedia, потом просит Gemini
+    переформулировать это смешно в стиле жужи. Всегда отвечает.
+    """
+    # Пробуем достать факты из Wikipedia
+    title, extract = await _fetch_wiki_extract(query)
+
+    # Просим Gemini сделать смешной ответ на основе найденного
+    funny_reply = await _juza_info_gemini_reply(query, extract)
+
+    if funny_reply:
+        return funny_reply
+
+    # Фолбэк — случайная смешная фраза
+    return random.choice(_INFO_FUNNY_FALLBACKS)
 
 
 # ── Мем Мелстрой ─────────────────────────────────────────────────────────────
@@ -2711,23 +2749,51 @@ async def run_bot(backend=None):
                 return
 
             _info_cooldowns[user_id] = now
+
+            # 20% шанс ответить GIF вместо текста
+            if random.random() < 0.20:
+                _INFO_GIF_POOL = [
+                    "https://media.giphy.com/media/3o7TKMt1VVNkHV2PaE/giphy.gif",
+                    "https://media.giphy.com/media/l3q2K5jinAlChoCLS/giphy.gif",
+                    "https://media.giphy.com/media/26ufdipQqU2lhNA4g/giphy.gif",
+                    "https://media.giphy.com/media/l46CyJmS9KUbokzsI/giphy.gif",
+                    "https://media.giphy.com/media/3oEjI6SIIHBdRxXI40/giphy.gif",
+                    "https://media.giphy.com/media/l0HlvtIPzPdt2usKs/giphy.gif",
+                    "https://media.giphy.com/media/xT9IgG50Lg7russbDB/giphy.gif",
+                    "https://media.giphy.com/media/26BRuo6sLetdllPAQ/giphy.gif",
+                    "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
+                    "https://media.giphy.com/media/3o7TKF5DnsSLv4zVBu/giphy.gif",
+                ]
+                gif_url = random.choice(_INFO_GIF_POOL)
+                _gif_captions = [
+                    f"вот всё что тебе надо знать про «{query}»",
+                    f"нашла инфу по запросу «{query}»",
+                    f"краткая справка: «{query}»",
+                    f"держи, это всё объясняет",
+                    f"изучай",
+                ]
+                try:
+                    await message.reply_animation(
+                        animation=gif_url,
+                        caption=random.choice(_gif_captions),
+                    )
+                except Exception:
+                    await message.reply(random.choice(_gif_captions))
+                return
+
             status_msg = await message.reply("🔍 Ищу информацию...")
             try:
                 result = await fetch_web_info(query)
                 if not result:
-                    await status_msg.edit_text(
-                        f"😔 Ничего не нашла по запросу «{query}»",
-                        parse_mode="HTML",
-                    )
-                    return
+                    result = random.choice(_INFO_FUNNY_FALLBACKS)
                 await status_msg.edit_text(result, parse_mode="HTML",
                                            disable_web_page_preview=True)
             except Exception as e:
                 logger.exception("Ошибка поиска информации: %s", e)
                 try:
-                    await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+                    await status_msg.edit_text(random.choice(_INFO_FUNNY_FALLBACKS))
                 except Exception:
-                    await message.reply(f"❌ Ошибка: {str(e)[:100]}")
+                    await message.reply(random.choice(_INFO_FUNNY_FALLBACKS))
             return
 
         if SEARCH_TRIGGER.lower() in text:
